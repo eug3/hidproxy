@@ -3,7 +3,48 @@
 #include <windows.h>
 #include <hidsdi.h>
 #include <setupapi.h>
+#include <wincrypt.h>
 #include <stdio.h>
+#include <vector>
+#include <string>
+
+static const USHORT kTargetVendorId = 0x096E;
+static const USHORT kTargetProductId = 0x0201;
+static const USHORT kVirtualVersion = 0x0100;
+//USB\VID_096E&PID_0201 飞天诚信(ftsafe) 飞天2无驱型 加密锁 rockey 2 ROCKEY2 R2
+static bool g_hasPhysicalTargetDevice = false;
+static bool g_virtualDeviceEnabled = false;
+static bool g_virtualIdentityConfigured = false;
+static DWORD g_virtualIdentityHid = 0;
+static DWORD g_virtualIdentityUid = 0;
+static bool g_virtualSectorAvailable[5] = { false, false, false, false, false };
+static std::wstring g_cacheDirectory;
+
+const std::wstring& GetCacheDirectory() {
+    if (!g_cacheDirectory.empty()) {
+        return g_cacheDirectory;
+    }
+    wchar_t path[MAX_PATH];
+    GetModuleFileNameW(g_hModule, path, MAX_PATH);
+    wchar_t* lastSlash = wcsrchr(path, L'\\');
+    if (lastSlash) {
+        *(lastSlash + 1) = 0;
+    }
+    g_cacheDirectory = path;
+    return g_cacheDirectory;
+}
+
+std::wstring GetConfigFilePath() {
+    std::wstring path = GetCacheDirectory();
+    path += L"virtual_device.cfg";
+    return path;
+}
+
+static std::wstring BuildSectorFilePath(DWORD uidValue, BYTE sector) {
+    wchar_t buffer[MAX_PATH];
+    swprintf_s(buffer, MAX_PATH, L"%smem_%u_sector%d.dat", GetCacheDirectory().c_str(), uidValue, sector);
+    return buffer;
+}
 
 // UID 数据采集结构
 struct UidDataCollector {
@@ -19,13 +60,16 @@ struct UidDataCollector {
     bool useCacheForNextRead; // 下一次读取是否使用缓存
     BYTE cachedData[512];    // 缓存的区数据
     bool hasCachedData;      // 是否有缓存数据
+    BYTE requestUid[4];      // 最近请求的 UID
+    bool hasRequestUid;
     
     UidDataCollector() : hasUid(false), useCacheForNextRead(false), hasCachedData(false),
-                        pendingReadSector(0xFF), pendingReadBlock(0xFF) {
+                        pendingReadSector(0xFF), pendingReadBlock(0xFF), hasRequestUid(false) {
         memset(uid, 0, sizeof(uid));
         memset(sectors, 0, sizeof(sectors));
         memset(sectorReceived, 0, sizeof(sectorReceived));
         memset(cachedData, 0, sizeof(cachedData));
+        memset(requestUid, 0, sizeof(requestUid));
         InitializeCriticalSection(&cs);
     }
     
@@ -36,39 +80,303 @@ struct UidDataCollector {
 
 static UidDataCollector g_uidCollector;
 
+struct VirtualFeatureContext {
+    BYTE sector;
+    BYTE block;
+    bool usedCache;
+};
+
+static bool BuildVirtualFeatureReport(PVOID reportBuffer, ULONG reportLength, VirtualFeatureContext* context) {
+    if (!reportBuffer || reportLength < 9) {
+        return false;
+    }
+    BYTE localUid[4] = {};
+    BYTE cachedBlock[64] = {};
+    BYTE sector = 0;
+    BYTE block = 0;
+    bool usedCache = false;
+    EnterCriticalSection(&g_uidCollector.cs);
+    if (g_uidCollector.pendingReadSector != 0xFF) {
+        sector = g_uidCollector.pendingReadSector;
+    }
+    if (g_uidCollector.pendingReadBlock != 0xFF && g_uidCollector.pendingReadBlock < 8) {
+        block = g_uidCollector.pendingReadBlock;
+    }
+    if (g_uidCollector.hasUid) {
+        memcpy(localUid, g_uidCollector.uid, sizeof(localUid));
+    } else if (g_uidCollector.hasRequestUid) {
+        memcpy(localUid, g_uidCollector.requestUid, sizeof(localUid));
+    }
+    if (g_uidCollector.hasCachedData && block < 8 && g_uidCollector.useCacheForNextRead) {
+        memcpy(cachedBlock, &g_uidCollector.cachedData[block * 64], sizeof(cachedBlock));
+        usedCache = true;
+    }
+    g_uidCollector.useCacheForNextRead = false;
+    LeaveCriticalSection(&g_uidCollector.cs);
+
+    BYTE* dst = static_cast<BYTE*>(reportBuffer);
+    ZeroMemory(dst, reportLength);
+    dst[0] = 0x00;
+    dst[1] = 0x00;
+    dst[2] = 0x81;
+    dst[3] = sector;
+    dst[4] = block;
+    memcpy(&dst[5], localUid, sizeof(localUid));
+
+    ULONG payloadOffset = 9;
+    if (reportLength > payloadOffset) {
+        ULONG payloadSize = min((ULONG)64, reportLength - payloadOffset);
+        memcpy(&dst[payloadOffset], cachedBlock, payloadSize);
+    }
+
+    if (context) {
+        context->sector = sector;
+        context->block = block;
+        context->usedCache = usedCache;
+    }
+    return true;
+}
+
+static bool CopyVirtualSectorToCache(BYTE sector) {
+    if (sector >= 5) {
+        return false;
+    }
+    bool copied = false;
+    EnterCriticalSection(&g_uidCollector.cs);
+    if (g_virtualIdentityConfigured && g_virtualSectorAvailable[sector]) {
+        memcpy(g_uidCollector.cachedData, g_uidCollector.sectors[sector], sizeof(g_uidCollector.cachedData));
+        g_uidCollector.hasCachedData = true;
+        copied = true;
+    }
+    LeaveCriticalSection(&g_uidCollector.cs);
+    return copied;
+}
+
+static bool ComputeMd5Hash(const BYTE* data, DWORD length, BYTE output[16]) {
+    HCRYPTPROV hProv = 0;
+    HCRYPTHASH hHash = 0;
+    if (!CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        return false;
+    }
+    if (!CryptCreateHash(hProv, CALG_MD5, 0, 0, &hHash)) {
+        CryptReleaseContext(hProv, 0);
+        return false;
+    }
+    BOOL ok = CryptHashData(hHash, data, length, 0);
+    DWORD hashLen = 16;
+    if (ok) {
+        ok = CryptGetHashParam(hHash, HP_HASHVAL, output, &hashLen, 0);
+    }
+    CryptDestroyHash(hHash);
+    CryptReleaseContext(hProv, 0);
+    return ok == TRUE;
+}
+
+static std::string BytesToHexUpper(const BYTE* data, size_t length) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string result;
+    result.reserve(length * 2);
+    for (size_t i = 0; i < length; ++i) {
+        result.push_back(hex[(data[i] >> 4) & 0x0F]);
+        result.push_back(hex[data[i] & 0x0F]);
+    }
+    return result;
+}
+
+static std::string GenerateVirtualChecksumString(DWORD uidValue, DWORD hidValue, int year) {
+    std::string uidStr = std::to_string(static_cast<unsigned long>(uidValue));
+    std::string hidStr = std::to_string(static_cast<unsigned long>(hidValue));
+    std::string yearStr = std::to_string(year);
+    std::string input = "1" + uidStr + "12" + hidStr + yearStr;
+    BYTE hash[16] = {};
+    if (!ComputeMd5Hash(reinterpret_cast<const BYTE*>(input.data()), static_cast<DWORD>(input.size()), hash)) {
+        return "0" + std::string(32, '0');
+    }
+    std::string md5Hex = BytesToHexUpper(hash, 16);
+    return "0" + md5Hex;
+}
+
+static bool DetectTargetHidDevice() {
+    GUID hidGuid;
+    HidD_GetHidGuid(&hidGuid);
+    HDEVINFO deviceInfo = SetupDiGetClassDevsW(&hidGuid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (deviceInfo == INVALID_HANDLE_VALUE) {
+        wchar_t msg[256];
+        swprintf_s(msg, 256, L"[DEVICE] SetupDiGetClassDevs failed: %lu", GetLastError());
+        LogMessage(msg);
+        return false;
+    }
+    bool found = false;
+    SP_DEVICE_INTERFACE_DATA interfaceData = {};
+    interfaceData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+    for (DWORD index = 0;; ++index) {
+        if (!SetupDiEnumDeviceInterfaces(deviceInfo, NULL, &hidGuid, index, &interfaceData)) {
+            if (GetLastError() != ERROR_NO_MORE_ITEMS) {
+                wchar_t err[256];
+                swprintf_s(err, 256, L"[DEVICE] SetupDiEnumDeviceInterfaces error: %lu", GetLastError());
+                LogMessage(err);
+            }
+            break;
+        }
+        DWORD requiredSize = 0;
+        SetupDiGetDeviceInterfaceDetailW(deviceInfo, &interfaceData, NULL, 0, &requiredSize, NULL);
+        if (requiredSize == 0) {
+            continue;
+        }
+        std::vector<BYTE> detailBuffer(requiredSize);
+        auto detailData = reinterpret_cast<PSP_DEVICE_INTERFACE_DETAIL_DATA_W>(detailBuffer.data());
+        detailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+        if (!SetupDiGetDeviceInterfaceDetailW(deviceInfo, &interfaceData, detailData, requiredSize, NULL, NULL)) {
+            wchar_t err[256];
+            swprintf_s(err, 256, L"[DEVICE] SetupDiGetDeviceInterfaceDetail failed: %lu", GetLastError());
+            LogMessage(err);
+            continue;
+        }
+        HANDLE deviceHandle = CreateFileW(detailData->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                                          FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                                          FILE_ATTRIBUTE_NORMAL, NULL);
+        if (deviceHandle == INVALID_HANDLE_VALUE) {
+            continue;
+        }
+        HIDD_ATTRIBUTES attributes = {};
+        attributes.Size = sizeof(HIDD_ATTRIBUTES);
+        if (HidD_GetAttributes(deviceHandle, &attributes)) {
+            if (attributes.VendorID == kTargetVendorId && attributes.ProductID == kTargetProductId) {
+                found = true;
+                CloseHandle(deviceHandle);
+                break;
+            }
+        }
+        CloseHandle(deviceHandle);
+    }
+    SetupDiDestroyDeviceInfoList(deviceInfo);
+    wchar_t msg[256];
+    if (found) {
+        swprintf_s(msg, 256, L"[DEVICE] Physical target HID detected (VID_%04X&PID_%04X)",
+                    kTargetVendorId, kTargetProductId);
+    } else {
+        swprintf_s(msg, 256, L"[DEVICE] No VID_%04X&PID_%04X device detected, virtualization enabled",
+                    kTargetVendorId, kTargetProductId);
+    }
+    LogMessage(msg);
+    return found;
+}
+
+void InitializeVirtualDeviceState() {
+    g_hasPhysicalTargetDevice = DetectTargetHidDevice();
+    g_virtualDeviceEnabled = !g_hasPhysicalTargetDevice;
+}
+
+bool IsVirtualDeviceActive() {
+    return g_virtualDeviceEnabled;
+}
+
+void ConfigureVirtualDeviceIdentity(DWORD hidValue, DWORD uidValue) {
+    EnterCriticalSection(&g_uidCollector.cs);
+    g_uidCollector.uid[0] = static_cast<BYTE>(uidValue & 0xFF);
+    g_uidCollector.uid[1] = static_cast<BYTE>((uidValue >> 8) & 0xFF);
+    g_uidCollector.uid[2] = static_cast<BYTE>((uidValue >> 16) & 0xFF);
+    g_uidCollector.uid[3] = static_cast<BYTE>((uidValue >> 24) & 0xFF);
+    memcpy(g_uidCollector.requestUid, g_uidCollector.uid, sizeof(g_uidCollector.uid));
+    g_uidCollector.hasUid = true;
+    g_uidCollector.hasRequestUid = true;
+    LeaveCriticalSection(&g_uidCollector.cs);
+
+    g_virtualIdentityConfigured = true;
+    g_virtualIdentityHid = hidValue;
+    g_virtualIdentityUid = uidValue;
+
+    wchar_t msg[256];
+    swprintf_s(msg, 256, L"[VIRTUAL] HID identity configured: HID=0x%08X UID=0x%08X",
+              hidValue, uidValue);
+    LogMessage(msg);
+}
+
+static void WriteAsciiToBuffer(BYTE* buffer, size_t bufferSize, const std::string& text) {
+    if (!buffer || bufferSize == 0) {
+        return;
+    }
+    size_t bytesToCopy = text.size() < bufferSize ? text.size() : bufferSize;
+    memcpy(buffer, text.data(), bytesToCopy);
+}
+
+void GenerateVirtualSectorsFromIdentity(DWORD hidValue, DWORD uidValue, int year) {
+    std::string uidDec = std::to_string(static_cast<unsigned long>(uidValue));
+    std::string hidDec = std::to_string(static_cast<unsigned long>(hidValue));
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    int currentYear = year != 0 ? year : st.wYear;
+    std::string checksum = GenerateVirtualChecksumString(uidValue, hidValue, currentYear);
+
+    EnterCriticalSection(&g_uidCollector.cs);
+    ZeroMemory(g_uidCollector.sectors[0], sizeof(g_uidCollector.sectors[0]));
+    ZeroMemory(g_uidCollector.sectors[1], sizeof(g_uidCollector.sectors[1]));
+
+    // Sector 0 - metadata and UID/HID information
+    memcpy(&g_uidCollector.sectors[0][0], &uidValue, sizeof(uidValue));
+    memcpy(&g_uidCollector.sectors[0][4], &hidValue, sizeof(hidValue));
+    WriteAsciiToBuffer(&g_uidCollector.sectors[0][16], 32, "UID:" + uidDec);
+    WriteAsciiToBuffer(&g_uidCollector.sectors[0][48], 32, "HID:" + hidDec);
+
+    // Sector 1 - checksum and status information
+    WriteAsciiToBuffer(&g_uidCollector.sectors[1][0], 32, "VIRTUAL CARD");
+    WriteAsciiToBuffer(&g_uidCollector.sectors[1][32], 32, "YEAR:" + std::to_string(currentYear));
+    WriteAsciiToBuffer(&g_uidCollector.sectors[1][64], 64, "UID:" + uidDec);
+    WriteAsciiToBuffer(&g_uidCollector.sectors[1][128], 64, "HID:" + hidDec);
+    WriteAsciiToBuffer(&g_uidCollector.sectors[1][2 * 64], 64, checksum);
+
+    for (int block = 0; block < 8; ++block) {
+        g_uidCollector.sectorReceived[0][block] = true;
+        g_uidCollector.sectorReceived[1][block] = true;
+    }
+    g_virtualSectorAvailable[0] = true;
+    g_virtualSectorAvailable[1] = true;
+    LeaveCriticalSection(&g_uidCollector.cs);
+
+    wchar_t msg[256];
+    swprintf_s(msg, 256, L"[VIRTUAL] Generated sector data (year=%d)", currentYear);
+    LogMessage(msg);
+}
+
 // 检查并加载缓存文件
 bool LoadCacheIfExists(BYTE sector, const BYTE* uid) {
-    wchar_t processPath[MAX_PATH];
-    GetModuleFileNameW(NULL, processPath, MAX_PATH);
-    
-    wchar_t* lastSlash = wcsrchr(processPath, L'\\');
-    if (lastSlash) {
-        *(lastSlash + 1) = 0;
+    if (!uid || sector > 4) {
+        return false;
     }
-    
-    // 将 UID 转换为十进制
-    DWORD uidDecimal = (uid[3] << 24) | (uid[2] << 16) | (uid[1] << 8) | uid[0];
-    
-    wchar_t filePath[MAX_PATH];
-    swprintf_s(filePath, MAX_PATH, L"%smem_%u_sector%d.dat", processPath, uidDecimal, sector);
-    
-    // 检查文件是否存在
-    HANDLE hFile = CreateFileW(filePath, GENERIC_READ, FILE_SHARE_READ, NULL,
-                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+
+    DWORD uidValue = static_cast<DWORD>(uid[0]) |
+                     (static_cast<DWORD>(uid[1]) << 8) |
+                     (static_cast<DWORD>(uid[2]) << 16) |
+                     (static_cast<DWORD>(uid[3]) << 24);
+    std::wstring filePath = BuildSectorFilePath(uidValue, sector);
+
+    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, NULL,
+                               OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (hFile != INVALID_HANDLE_VALUE) {
-        DWORD bytesRead;
-        bool success = ReadFile(hFile, g_uidCollector.cachedData, 512, &bytesRead, NULL);
+        BYTE localBuffer[512] = {};
+        DWORD bytesRead = 0;
+        bool success = ReadFile(hFile, localBuffer, sizeof(localBuffer), &bytesRead, NULL);
         CloseHandle(hFile);
-        
-        if (success && bytesRead == 512) {
+        if (success && bytesRead == sizeof(localBuffer)) {
+            EnterCriticalSection(&g_uidCollector.cs);
+            memcpy(g_uidCollector.cachedData, localBuffer, sizeof(localBuffer));
             g_uidCollector.hasCachedData = true;
+            LeaveCriticalSection(&g_uidCollector.cs);
             wchar_t msg[256];
-            swprintf_s(msg, 256, L"[CACHE] Loaded sector %d from cache: %s", sector, filePath);
+            swprintf_s(msg, 256, L"[CACHE] Loaded sector %d from cache: %s", sector, filePath.c_str());
             LogMessage(msg);
             return true;
         }
     }
-    
+
+    if (g_virtualDeviceEnabled && g_virtualIdentityConfigured) {
+        if (CopyVirtualSectorToCache(sector)) {
+            wchar_t msg[256];
+            swprintf_s(msg, 256, L"[VIRTUAL] Using synthesized data for sector %d", sector);
+            LogMessage(msg);
+            return true;
+        }
+    }
     return false;
 }
 
@@ -282,6 +590,7 @@ static BOOLEAN (WINAPI* Real_HidD_GetFeature)(HANDLE, PVOID, ULONG) = HidD_GetFe
 static BOOLEAN (WINAPI* Real_HidD_SetFeature)(HANDLE, PVOID, ULONG) = HidD_SetFeature;
 static BOOLEAN (WINAPI* Real_HidD_GetPreparsedData)(HANDLE, PHIDP_PREPARSED_DATA*) = HidD_GetPreparsedData;
 static BOOLEAN (WINAPI* Real_HidD_FreePreparsedData)(PHIDP_PREPARSED_DATA) = HidD_FreePreparsedData;
+static BOOLEAN (WINAPI* Real_HidD_FlushQueue)(HANDLE) = HidD_FlushQueue;
 
 // Hook 函数实现
 VOID WINAPI Hook_HidD_GetHidGuid(LPGUID HidGuid) {
@@ -291,13 +600,26 @@ VOID WINAPI Hook_HidD_GetHidGuid(LPGUID HidGuid) {
 
 BOOLEAN WINAPI Hook_HidD_GetAttributes(HANDLE HidDeviceObject, PHIDD_ATTRIBUTES Attributes) {
     BOOLEAN result = Real_HidD_GetAttributes(HidDeviceObject, Attributes);
+    bool virtualResponse = false;
+    
+    if (!result && g_virtualDeviceEnabled && Attributes) {
+        ZeroMemory(Attributes, sizeof(HIDD_ATTRIBUTES));
+        Attributes->Size = sizeof(HIDD_ATTRIBUTES);
+        Attributes->VendorID = kTargetVendorId;
+        Attributes->ProductID = kTargetProductId;
+        Attributes->VersionNumber = kVirtualVersion;
+        result = TRUE;
+        virtualResponse = true;
+    }
     
     if (result && Attributes) {
         wchar_t details[256];
-        swprintf_s(details, 256, 
+        swprintf_s(details, 256,
+                 virtualResponse ?
+                 L"VID=0x%04X, PID=0x%04X, Version=0x%04X (virtual)" :
                  L"VID=0x%04X, PID=0x%04X, Version=0x%04X",
-                 Attributes->VendorID, 
-                 Attributes->ProductID, 
+                 Attributes->VendorID,
+                 Attributes->ProductID,
                  Attributes->VersionNumber);
         LogHidCall(L"HidD_GetAttributes", details);
     } else {
@@ -309,42 +631,55 @@ BOOLEAN WINAPI Hook_HidD_GetAttributes(HANDLE HidDeviceObject, PHIDD_ATTRIBUTES 
 
 BOOLEAN WINAPI Hook_HidD_GetFeature(HANDLE HidDeviceObject, PVOID ReportBuffer, ULONG ReportBufferLength) {
     BOOLEAN result = Real_HidD_GetFeature(HidDeviceObject, ReportBuffer, ReportBufferLength);
+    bool usedCache = false;
+    bool virtualized = false;
     
     if (result) {
         // 检查是否需要使用缓存
         EnterCriticalSection(&g_uidCollector.cs);
-        bool useCache = g_uidCollector.useCacheForNextRead && g_uidCollector.hasCachedData;
+        usedCache = g_uidCollector.useCacheForNextRead && g_uidCollector.hasCachedData;
         BYTE sector = g_uidCollector.pendingReadSector;
         BYTE block = g_uidCollector.pendingReadBlock;
         
-        if (useCache && ReportBufferLength >= 73) {
-            // 保持头部 (5字节) + UID (4字节) ，替换剩余数据
+        if (usedCache && ReportBufferLength >= 73 && block < 8) {
             BYTE* data = (BYTE*)ReportBuffer;
             ULONG dataOffset = 9;
             ULONG dataSize = min(64, ReportBufferLength - dataOffset);
-            
-            // 从缓存中获取对应块的数据
             memcpy(&data[dataOffset], &g_uidCollector.cachedData[block * 64], dataSize);
-            
             wchar_t msg[256];
             swprintf_s(msg, 256, L"[CACHE] Replaced data with cache: Sector %d, Block %d", sector, block);
             LogMessage(msg);
-            
-            // 重置缓存标志
             g_uidCollector.useCacheForNextRead = false;
         }
         LeaveCriticalSection(&g_uidCollector.cs);
-        
+    } else if (g_virtualDeviceEnabled) {
+        VirtualFeatureContext ctx{};
+        if (BuildVirtualFeatureReport(ReportBuffer, ReportBufferLength, &ctx)) {
+            result = TRUE;
+            usedCache = ctx.usedCache;
+            virtualized = true;
+        }
+    }
+    
+    if (result) {
         wchar_t details[512];
-        swprintf_s(details, 512, L"Success: %u bytes%s", ReportBufferLength, useCache ? L" (FROM CACHE)" : L"");
+        if (virtualized) {
+            swprintf_s(details, 512, L"Success: %u bytes (VIRTUAL%s)", ReportBufferLength,
+                       usedCache ? L" CACHE" : L"");
+        } else {
+            swprintf_s(details, 512, L"Success: %u bytes%s", ReportBufferLength,
+                       usedCache ? L" (FROM CACHE)" : L"");
+        }
         LogHidCall(L"HidD_GetFeature", details);
-        
-        // Output full hex dump
         if (ReportBufferLength > 0) {
-            LogHexDump(useCache ? L"Data received (cached)" : L"Data received", (BYTE*)ReportBuffer, ReportBufferLength);
-            
-            // 处理 UID 数据 (只在非缓存时)
-            if (!useCache) {
+            const wchar_t* label;
+            if (virtualized) {
+                label = usedCache ? L"Data generated (virtual cache)" : L"Data generated (virtual placeholder)";
+            } else {
+                label = usedCache ? L"Data received (cached)" : L"Data received";
+            }
+            LogHexDump(label, (BYTE*)ReportBuffer, ReportBufferLength);
+            if (!usedCache && !virtualized) {
                 ProcessUidData((BYTE*)ReportBuffer, ReportBufferLength);
             }
         }
@@ -383,6 +718,12 @@ BOOLEAN WINAPI Hook_HidD_SetFeature(HANDLE HidDeviceObject, PVOID ReportBuffer, 
             EnterCriticalSection(&g_uidCollector.cs);
             g_uidCollector.pendingReadSector = sector;
             g_uidCollector.pendingReadBlock = block;
+            memcpy(g_uidCollector.requestUid, uid, sizeof(uid));
+            g_uidCollector.hasRequestUid = true;
+            if (!g_uidCollector.hasUid) {
+                memcpy(g_uidCollector.uid, uid, sizeof(uid));
+                g_uidCollector.hasUid = true;
+            }
             
             // 尝试加载缓存
             if (LoadCacheIfExists(sector, uid)) {
@@ -400,11 +741,26 @@ BOOLEAN WINAPI Hook_HidD_SetFeature(HANDLE HidDeviceObject, PVOID ReportBuffer, 
     BOOLEAN result = Real_HidD_SetFeature(HidDeviceObject, ReportBuffer, ReportBufferLength);
     
     if (!result) {
-        wchar_t errMsg[128];
-        swprintf_s(errMsg, 128, L"  SetFeature failed, error: %d", GetLastError());
-        LogMessage(errMsg);
+        if (g_virtualDeviceEnabled) {
+            result = TRUE;
+            LogMessage(L"[VIRTUAL] HidD_SetFeature acknowledged without physical device");
+        } else {
+            wchar_t errMsg[128];
+            swprintf_s(errMsg, 128, L"  SetFeature failed, error: %d", GetLastError());
+            LogMessage(errMsg);
+        }
     }
     
+    return result;
+}
+
+BOOLEAN WINAPI Hook_HidD_FlushQueue(HANDLE HidDeviceObject) {
+    BOOLEAN result = Real_HidD_FlushQueue(HidDeviceObject);
+    if (!result && g_virtualDeviceEnabled) {
+        LogHidCall(L"HidD_FlushQueue", L"Virtual success");
+        return TRUE;
+    }
+    LogHidCall(L"HidD_FlushQueue", result ? L"Success" : L"Failed");
     return result;
 }
 
@@ -427,6 +783,7 @@ bool InstallHidHooks() {
     DetourAttach(&(PVOID&)Real_HidD_GetAttributes, Hook_HidD_GetAttributes);
     DetourAttach(&(PVOID&)Real_HidD_GetFeature, Hook_HidD_GetFeature);
     DetourAttach(&(PVOID&)Real_HidD_SetFeature, Hook_HidD_SetFeature);
+    DetourAttach(&(PVOID&)Real_HidD_FlushQueue, Hook_HidD_FlushQueue);
     DetourAttach(&(PVOID&)Real_HidD_GetPreparsedData, Hook_HidD_GetPreparsedData);
     DetourAttach(&(PVOID&)Real_HidD_FreePreparsedData, Hook_HidD_FreePreparsedData);
     
@@ -443,6 +800,7 @@ void UninstallHidHooks() {
     DetourDetach(&(PVOID&)Real_HidD_GetAttributes, Hook_HidD_GetAttributes);
     DetourDetach(&(PVOID&)Real_HidD_GetFeature, Hook_HidD_GetFeature);
     DetourDetach(&(PVOID&)Real_HidD_SetFeature, Hook_HidD_SetFeature);
+    DetourDetach(&(PVOID&)Real_HidD_FlushQueue, Hook_HidD_FlushQueue);
     DetourDetach(&(PVOID&)Real_HidD_GetPreparsedData, Hook_HidD_GetPreparsedData);
     DetourDetach(&(PVOID&)Real_HidD_FreePreparsedData, Hook_HidD_FreePreparsedData);
     

@@ -14,6 +14,7 @@ add_executable(hid_launcher
 add_library(hid_hook SHARED
     hook_dll/dllmain.cpp
     hook_dll/hid_hooks.cpp
+    hook_dll/network_hooks.cpp
     hook_dll/logging.cpp
 )
 
@@ -30,6 +31,8 @@ target_compile_definitions(hid_hook PRIVATE
 target_link_libraries(hid_hook PRIVATE
     hid.lib
     setupapi.lib
+    ws2_32.lib
+    advapi32.lib
 )
 
 # If Detours library exists
