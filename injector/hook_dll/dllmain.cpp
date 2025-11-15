@@ -1,3 +1,5 @@
+// Include winsock2.h BEFORE windows.h to avoid conflicts
+#include "network_hooks.h"  // This includes winsock2.h
 #include <windows.h>
 #include <stdio.h>
 #include <string>
@@ -5,7 +7,6 @@
 #include <wchar.h>
 #include "hid_hooks.h"
 #include "logging.h"
-#include "network_hooks.h"
 
 HMODULE g_hModule = NULL;
 
@@ -183,79 +184,34 @@ static bool LoadVirtualIdentityConfig(const std::wstring& directory, DWORD& hidO
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason, LPVOID lpReserved) {
     switch (ul_reason) {
-    case DLL_PROCESS_ATTACH:
+    case DLL_PROCESS_ATTACH: {
         DisableThreadLibraryCalls(hModule);
         g_hModule = hModule;
         
-        // Initialize logging
-        InitializeLogging();
-        LogMessage(L"========================================");
-        LogMessage(L"  HID Hook DLL Loaded");
-        LogMessage(L"========================================");
-        
-        // Get process information
-        wchar_t processPath[MAX_PATH];
-        GetModuleFileNameW(NULL, processPath, MAX_PATH);
-        
-        wchar_t logMsg[512];
-        swprintf_s(logMsg, 512, L"Target Process: %s", processPath);
-        LogMessage(logMsg);
-        
-        swprintf_s(logMsg, 512, L"DLL Base: 0x%p", hModule);
-        LogMessage(logMsg);
-
-        LogMessage(L"[INFO] Scanning for VID_096E&PID_0304 devices...");
-        InitializeVirtualDeviceState();
-
-        if (IsVirtualDeviceActive()) {
-            wchar_t dllPath[MAX_PATH];
-            GetModuleFileNameW(hModule, dllPath, MAX_PATH);
-            wchar_t* lastSlash = wcsrchr(dllPath, L'\\');
-            if (lastSlash) {
-                *(lastSlash + 1) = 0;
-            }
-
-            DWORD virtualHid = 0;
-            DWORD virtualUid = 0;
-            int virtualYear = 0;
-            if (LoadVirtualIdentityConfig(dllPath, virtualHid, virtualUid, virtualYear)) {
-                ConfigureVirtualDeviceIdentity(virtualHid, virtualUid);
-                GenerateVirtualSectorsFromIdentity(virtualHid, virtualUid, virtualYear);
-            } else {
-                LogMessage(L"[VIRTUAL] Unable to load HID/UID identity; using defaults");
-            }
-        }
+        // 最小化初始化：仅安装Hook
+        // 日志在第一次Hook调用时才初始化
+        // 缓存在第一次HID API调用时才加载
         
         // Install HID Hooks
-        LogMessage(L"Installing HID Hooks...");
-        if (InstallHidHooks()) {
-            LogMessage(L"[OK] HID Hooks installed successfully");
-        } else {
-            LogMessage(L"[ERROR] Failed to install HID Hooks");
+        if (!InstallHidHooks()) {
+            return FALSE;  // Hook安装失败，拒绝加载
         }
 
-        LogMessage(L"Installing network hooks...");
-        if (InstallNetworkHooks()) {
-            LogMessage(L"[OK] Network hooks installed successfully");
-        } else {
-            LogMessage(L"[ERROR] Failed to install network hooks");
+        // Install network hooks
+        if (!InstallNetworkHooks()) {
+            UninstallHidHooks();
+            return FALSE;
         }
         
-        LogMessage(L"========================================");
         break;
+    }
 
     case DLL_PROCESS_DETACH:
-        LogMessage(L"========================================");
-        LogMessage(L"  HID Hook DLL Unloading");
-        LogMessage(L"========================================");
-        
         // Uninstall Hooks
         UninstallNetworkHooks();
-        LogMessage(L"[OK] Network hooks uninstalled");
         UninstallHidHooks();
-        LogMessage(L"[OK] HID Hooks uninstalled");
         
-        // 关闭日志
+        // 关闭日志（如果已初始化）
         ShutdownLogging();
         break;
     }

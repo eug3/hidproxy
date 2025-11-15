@@ -1,7 +1,9 @@
 #include "network_hooks.h"
 #include "logging.h"
 #include <ws2tcpip.h>
-#include <windows.h>
+#include <stdio.h>
+// Note: winsock2.h is already included in network_hooks.h
+// windows.h is NOT needed here as it conflicts with winsock2.h
 
 static bool g_forceOfflineNetwork = true;
 

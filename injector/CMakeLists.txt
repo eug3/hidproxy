@@ -5,9 +5,26 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Launcher executable (starts process with DLL injection)
+# Changed to console application for better debugging output
 add_executable(hid_launcher
     launcher/main.cpp
     launcher/app.manifest
+)
+
+# Test target executable (Rockey2 HID reader)
+add_executable(Xsjzb
+    test_launcher/test_target.cpp
+)
+
+target_link_libraries(Xsjzb PRIVATE
+    hid.lib
+    setupapi.lib
+    wininet.lib
+)
+
+target_compile_definitions(Xsjzb PRIVATE
+    UNICODE
+    _UNICODE
 )
 
 # HID Hook DLL (injected DLL)
@@ -54,13 +71,19 @@ set_target_properties(hid_launcher PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
+set_target_properties(Xsjzb PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+)
+
 set_target_properties(hid_hook PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
 # Install targets
-install(TARGETS hid_launcher hid_hook
+install(TARGETS hid_launcher Xsjzb hid_hook
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION bin
 )
+add_executable(test_hid_enum test_hid_enum.cpp)
+target_link_libraries(test_hid_enum hid setupapi)

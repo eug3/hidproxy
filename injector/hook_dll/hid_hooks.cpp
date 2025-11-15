@@ -20,6 +20,145 @@ static DWORD g_virtualIdentityUid = 0;
 static bool g_virtualSectorAvailable[5] = { false, false, false, false, false };
 static std::wstring g_cacheDirectory;
 
+// 全局缓存数据
+static CachedHidData g_hidCache = { 0 };
+static bool g_cacheLoadAttempted = false;  // 延迟加载标志
+static std::vector<HANDLE> g_hijackedHandles;  // 保存所有被劫持的句柄
+static CRITICAL_SECTION g_hijackedHandlesCs;  // 保护句柄列表的临界区
+
+// 初始化临界区(只调用一次)
+static void InitHijackedHandles() {
+    static bool initialized = false;
+    if (!initialized) {
+        InitializeCriticalSection(&g_hijackedHandlesCs);
+        initialized = true;
+    }
+}
+
+// 检查句柄是否被劫持
+static bool IsHijackedHandle(HANDLE h) {
+    EnterCriticalSection(&g_hijackedHandlesCs);
+    bool found = std::find(g_hijackedHandles.begin(), g_hijackedHandles.end(), h) != g_hijackedHandles.end();
+    LeaveCriticalSection(&g_hijackedHandlesCs);
+    return found;
+}
+
+// 延迟加载缓存（线程安全）
+static void EnsureCacheLoaded() {
+    if (g_cacheLoadAttempted) {
+        return;  // 已经尝试过加载了
+    }
+    
+    // 使用静态局部变量实现一次性初始化
+    static LONG initFlag = 0;
+    if (InterlockedCompareExchange(&initFlag, 1, 0) == 0) {
+        // 第一次调用时初始化日志
+        InitializeLogging();
+        
+        // 记录进程信息
+        wchar_t processPath[MAX_PATH];
+        GetModuleFileNameW(NULL, processPath, MAX_PATH);
+        wchar_t logMsg[512];
+        swprintf_s(logMsg, 512, L"[INIT] Target Process: %s", processPath);
+        LogMessage(logMsg);
+        swprintf_s(logMsg, 512, L"[INIT] DLL Base: 0x%p", g_hModule);
+        LogMessage(logMsg);
+        
+        LogMessage(L"[LAZY INIT] First HID API call - loading cache now...");
+        
+        // 加载缓存文件
+        std::wstring cacheDir = GetCacheDirectory();
+        WIN32_FIND_DATAW findData;
+        wchar_t searchPath[MAX_PATH];
+        swprintf_s(searchPath, L"%s*_device.cfg", cacheDir.c_str());
+        
+        HANDLE hFind = FindFirstFileW(searchPath, &findData);
+        if (hFind != INVALID_HANDLE_VALUE) {
+            // 找到配置文件
+            wchar_t configPath[MAX_PATH];
+            swprintf_s(configPath, L"%s%s", cacheDir.c_str(), findData.cFileName);
+            
+            FILE* fp = _wfopen(configPath, L"r");
+            if (fp) {
+                char line[512];
+                while (fgets(line, sizeof(line), fp)) {
+                    if (strncmp(line, "HID=", 4) == 0) {
+                        sscanf_s(line + 4, "0x%X", &g_hidCache.cachedHid);
+                    } else if (strncmp(line, "UID=", 4) == 0) {
+                        sscanf_s(line + 4, "0x%X", &g_hidCache.cachedUid);
+                    } else if (strncmp(line, "VID=", 4) == 0) {
+                        sscanf_s(line + 4, "0x%hX", &g_hidCache.vendorId);
+                    } else if (strncmp(line, "PID=", 4) == 0) {
+                        sscanf_s(line + 4, "0x%hX", &g_hidCache.productId);
+                    } else if (strncmp(line, "Version=", 8) == 0) {
+                        sscanf_s(line + 8, "0x%hX", &g_hidCache.versionNumber);
+                    } else if (strncmp(line, "ProductString=", 14) == 0) {
+                        char productStr[256];
+                        strncpy_s(productStr, sizeof(productStr), line + 14, _TRUNCATE);
+                        // 去除行尾换行符
+                        size_t len = strlen(productStr);
+                        if (len > 0 && (productStr[len-1] == '\n' || productStr[len-1] == '\r')) {
+                            productStr[len-1] = '\0';
+                        }
+                        if (len > 1 && (productStr[len-2] == '\n' || productStr[len-2] == '\r')) {
+                            productStr[len-2] = '\0';
+                        }
+                        MultiByteToWideChar(CP_ACP, 0, productStr, -1, g_hidCache.productString, 256);
+                    } else if (strncmp(line, "SerialNumberString=", 19) == 0) {
+                        char serialStr[256];
+                        strncpy_s(serialStr, sizeof(serialStr), line + 19, _TRUNCATE);
+                        // 去除行尾换行符
+                        size_t len = strlen(serialStr);
+                        if (len > 0 && (serialStr[len-1] == '\n' || serialStr[len-1] == '\r')) {
+                            serialStr[len-1] = '\0';
+                        }
+                        if (len > 1 && (serialStr[len-2] == '\n' || serialStr[len-2] == '\r')) {
+                            serialStr[len-2] = '\0';
+                        }
+                        MultiByteToWideChar(CP_ACP, 0, serialStr, -1, g_hidCache.serialNumberString, 256);
+                    } else if (strncmp(line, "FeatureReportLength=", 20) == 0) {
+                        sscanf_s(line + 20, "%hu", &g_hidCache.featureReportLength);
+                    } else if (strncmp(line, "InputReportLength=", 18) == 0) {
+                        sscanf_s(line + 18, "%hu", &g_hidCache.inputReportLength);
+                    } else if (strncmp(line, "OutputReportLength=", 19) == 0) {
+                        sscanf_s(line + 19, "%hu", &g_hidCache.outputReportLength);
+                    } else if (strncmp(line, "Usage=", 6) == 0) {
+                        sscanf_s(line + 6, "%hu", &g_hidCache.usage);
+                    } else if (strncmp(line, "UsagePage=", 10) == 0) {
+                        sscanf_s(line + 10, "%hu", &g_hidCache.usagePage);
+                    }
+                }
+                fclose(fp);
+                
+                // 加载数据块文件
+                wchar_t dataPath[MAX_PATH];
+                swprintf_s(dataPath, L"%smem_%u_sector0.dat", cacheDir.c_str(), g_hidCache.cachedUid);
+                fp = _wfopen(dataPath, L"rb");
+                if (fp) {
+                    fread(g_hidCache.partition0, 1, 512, fp);
+                    fclose(fp);
+                }
+                
+                swprintf_s(dataPath, L"%smem_%u_sector1.dat", cacheDir.c_str(), g_hidCache.cachedUid);
+                fp = _wfopen(dataPath, L"rb");
+                if (fp) {
+                    fread(g_hidCache.partition1, 1, 512, fp);
+                    fclose(fp);
+                }
+                
+                g_hidCache.isValid = true;
+            }
+            FindClose(hFind);
+        }
+        
+        g_cacheLoadAttempted = true;
+        LogMessage(g_hidCache.isValid ? 
+                   L"[LAZY INIT] Cache loaded successfully" : 
+                   L"[LAZY INIT] Cache load failed - using passthrough mode");
+    }
+}
+
+
 const std::wstring& GetCacheDirectory() {
     if (!g_cacheDirectory.empty()) {
         return g_cacheDirectory;
@@ -31,6 +170,7 @@ const std::wstring& GetCacheDirectory() {
         *(lastSlash + 1) = 0;
     }
     g_cacheDirectory = path;
+    g_cacheDirectory += L"cache\\";  // 添加cache子目录
     return g_cacheDirectory;
 }
 
@@ -591,6 +731,21 @@ static BOOLEAN (WINAPI* Real_HidD_SetFeature)(HANDLE, PVOID, ULONG) = HidD_SetFe
 static BOOLEAN (WINAPI* Real_HidD_GetPreparsedData)(HANDLE, PHIDP_PREPARSED_DATA*) = HidD_GetPreparsedData;
 static BOOLEAN (WINAPI* Real_HidD_FreePreparsedData)(PHIDP_PREPARSED_DATA) = HidD_FreePreparsedData;
 static BOOLEAN (WINAPI* Real_HidD_FlushQueue)(HANDLE) = HidD_FlushQueue;
+static NTSTATUS (WINAPI* Real_HidP_GetCaps)(PHIDP_PREPARSED_DATA, PHIDP_CAPS) = HidP_GetCaps;
+static BOOLEAN (WINAPI* Real_HidD_GetProductString)(HANDLE, PVOID, ULONG) = HidD_GetProductString;
+static BOOLEAN (WINAPI* Real_HidD_GetSerialNumberString)(HANDLE, PVOID, ULONG) = HidD_GetSerialNumberString;
+
+// SetupDi API (用于设备枚举)
+static BOOL (WINAPI* Real_SetupDiEnumDeviceInterfaces)(HDEVINFO, PSP_DEVINFO_DATA, CONST GUID*, DWORD, PSP_DEVICE_INTERFACE_DATA) = SetupDiEnumDeviceInterfaces;
+static BOOL (WINAPI* Real_SetupDiGetDeviceInterfaceDetailW)(HDEVINFO, PSP_DEVICE_INTERFACE_DATA, PSP_DEVICE_INTERFACE_DETAIL_DATA_W, DWORD, PDWORD, PSP_DEVINFO_DATA) = SetupDiGetDeviceInterfaceDetailW;
+static HANDLE (WINAPI* Real_CreateFileW)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE) = CreateFileW;
+
+// 虚拟设备注入状态（每次枚举会话）
+static HDEVINFO g_lastDeviceInfoHandle = NULL;  // 当前枚举会话的句柄
+static DWORD g_lastRealDeviceIndex = 0;  // 真实设备的最后索引
+static bool g_virtualDeviceInjected = false;  // 是否已注入虚拟设备
+static const DWORD VIRTUAL_DEVICE_INDEX_MARKER = 0xFFFFFFFF;  // 虚拟设备的特殊索引
+#define VIRTUAL_DEVICE_PATH L"\\\\?\\HID#VID_096E&PID_0201#VIRTUAL_CACHE#{4d1e55b2-f16f-11cf-88cb-001111000030}"
 
 // Hook 函数实现
 VOID WINAPI Hook_HidD_GetHidGuid(LPGUID HidGuid) {
@@ -599,28 +754,71 @@ VOID WINAPI Hook_HidD_GetHidGuid(LPGUID HidGuid) {
 }
 
 BOOLEAN WINAPI Hook_HidD_GetAttributes(HANDLE HidDeviceObject, PHIDD_ATTRIBUTES Attributes) {
-    BOOLEAN result = Real_HidD_GetAttributes(HidDeviceObject, Attributes);
-    bool virtualResponse = false;
+    EnsureCacheLoaded();
     
-    if (!result && g_virtualDeviceEnabled && Attributes) {
-        ZeroMemory(Attributes, sizeof(HIDD_ATTRIBUTES));
+    // 【策略】只劫持第一个真实设备,其他设备返回失败
+    static bool firstDeviceHijacked = false;
+    
+    // 如果是虚拟句柄,总是返回虚拟设备信息
+    if (HidDeviceObject == (HANDLE)0xCAFEBABE && g_hidCache.isValid && Attributes) {
         Attributes->Size = sizeof(HIDD_ATTRIBUTES);
-        Attributes->VendorID = kTargetVendorId;
-        Attributes->ProductID = kTargetProductId;
-        Attributes->VersionNumber = kVirtualVersion;
-        result = TRUE;
-        virtualResponse = true;
+        Attributes->VendorID = g_hidCache.vendorId;
+        Attributes->ProductID = g_hidCache.productId;
+        Attributes->VersionNumber = g_hidCache.versionNumber;
+        
+        wchar_t details[256];
+        swprintf_s(details, 256, L"VID=0x%04X, PID=0x%04X, Version=0x%04X [VIRTUAL HANDLE]",
+                   Attributes->VendorID, Attributes->ProductID, Attributes->VersionNumber);
+        LogHidCall(L"HidD_GetAttributes", details);
+        return TRUE;
+    }
+    
+    // 如果有缓存且第一个设备还没被劫持,劫持这个设备
+    if (g_hidCache.isValid && !firstDeviceHijacked && Attributes) {
+        firstDeviceHijacked = true;
+        
+        // 添加到劫持句柄列表
+        InitHijackedHandles();
+        EnterCriticalSection(&g_hijackedHandlesCs);
+        g_hijackedHandles.push_back(HidDeviceObject);
+        LeaveCriticalSection(&g_hijackedHandlesCs);
+        
+        Attributes->Size = sizeof(HIDD_ATTRIBUTES);
+        Attributes->VendorID = g_hidCache.vendorId;
+        Attributes->ProductID = g_hidCache.productId;
+        Attributes->VersionNumber = g_hidCache.versionNumber;
+        
+        wchar_t details[256];
+        swprintf_s(details, 256, L"VID=0x%04X, PID=0x%04X, Version=0x%04X [FIRST DEVICE HIJACKED - Handle=0x%p]",
+                   Attributes->VendorID, Attributes->ProductID, Attributes->VersionNumber, HidDeviceObject);
+        LogHidCall(L"HidD_GetAttributes", details);
+        
+        return TRUE;
+    }
+    
+    // 其他真实设备正常调用
+    BOOLEAN result = Real_HidD_GetAttributes(HidDeviceObject, Attributes);
+    
+    // 如果是目标 VID/PID 的设备,也添加到劫持列表
+    if (result && g_hidCache.isValid && Attributes &&
+        Attributes->VendorID == g_hidCache.vendorId &&
+        Attributes->ProductID == g_hidCache.productId) {
+        
+        InitHijackedHandles();
+        EnterCriticalSection(&g_hijackedHandlesCs);
+        if (std::find(g_hijackedHandles.begin(), g_hijackedHandles.end(), HidDeviceObject) == g_hijackedHandles.end()) {
+            g_hijackedHandles.push_back(HidDeviceObject);
+            wchar_t msg[256];
+            swprintf_s(msg, 256, L"[HIJACK] Added handle 0x%p to hijack list (real device with matching VID/PID)", HidDeviceObject);
+            LogMessage(msg);
+        }
+        LeaveCriticalSection(&g_hijackedHandlesCs);
     }
     
     if (result && Attributes) {
         wchar_t details[256];
-        swprintf_s(details, 256,
-                 virtualResponse ?
-                 L"VID=0x%04X, PID=0x%04X, Version=0x%04X (virtual)" :
-                 L"VID=0x%04X, PID=0x%04X, Version=0x%04X",
-                 Attributes->VendorID,
-                 Attributes->ProductID,
-                 Attributes->VersionNumber);
+        swprintf_s(details, 256, L"VID=0x%04X, PID=0x%04X, Version=0x%04X [REAL DEVICE]",
+                 Attributes->VendorID, Attributes->ProductID, Attributes->VersionNumber);
         LogHidCall(L"HidD_GetAttributes", details);
     } else {
         LogHidCall(L"HidD_GetAttributes", L"Failed");
@@ -630,11 +828,51 @@ BOOLEAN WINAPI Hook_HidD_GetAttributes(HANDLE HidDeviceObject, PHIDD_ATTRIBUTES 
 }
 
 BOOLEAN WINAPI Hook_HidD_GetFeature(HANDLE HidDeviceObject, PVOID ReportBuffer, ULONG ReportBufferLength) {
-    BOOLEAN result = Real_HidD_GetFeature(HidDeviceObject, ReportBuffer, ReportBufferLength);
+    EnsureCacheLoaded();
+    
+    BOOLEAN result = FALSE;
     bool usedCache = false;
     bool virtualized = false;
     
-    if (result) {
+    // 如果有缓存,直接从缓存返回数据(不检查句柄)
+    if (g_hidCache.isValid) {
+        // 从缓存返回数据
+        EnterCriticalSection(&g_uidCollector.cs);
+        BYTE sector = g_uidCollector.pendingReadSector;
+        BYTE block = g_uidCollector.pendingReadBlock;
+        
+        if (ReportBufferLength >= 73 && block < 8 && sector < 2) {
+            BYTE* data = (BYTE*)ReportBuffer;
+            ZeroMemory(data, ReportBufferLength);
+            data[0] = 0x00;
+            data[1] = 0x00;  // No error
+            data[2] = 0x81;  // Read command
+            data[3] = sector;
+            data[4] = block;
+            memcpy(&data[5], &g_hidCache.cachedUid, 4);
+            
+            // Copy data from cache
+            if (sector == 0) {
+                memcpy(&data[9], g_hidCache.partition0[block], 64);
+            } else {
+                memcpy(&data[9], g_hidCache.partition1[block], 64);
+            }
+            
+            result = TRUE;
+            usedCache = true;
+            virtualized = true;
+            
+            wchar_t msg[256];
+            swprintf_s(msg, 256, L"[CACHED DATA] GetFeature: Sector=%d, Block=%d, Handle=0x%p", 
+                       sector, block, HidDeviceObject);
+            LogMessage(msg);
+        }
+        LeaveCriticalSection(&g_uidCollector.cs);
+    } else {
+        result = Real_HidD_GetFeature(HidDeviceObject, ReportBuffer, ReportBufferLength);
+    }
+    
+    if (result && !virtualized) {
         // 检查是否需要使用缓存
         EnterCriticalSection(&g_uidCollector.cs);
         usedCache = g_uidCollector.useCacheForNextRead && g_uidCollector.hasCachedData;
@@ -693,9 +931,33 @@ BOOLEAN WINAPI Hook_HidD_GetFeature(HANDLE HidDeviceObject, PVOID ReportBuffer, 
 }
 
 BOOLEAN WINAPI Hook_HidD_SetFeature(HANDLE HidDeviceObject, PVOID ReportBuffer, ULONG ReportBufferLength) {
+    EnsureCacheLoaded();
+    
     wchar_t details[512];
     swprintf_s(details, 512, L"Write: %u bytes", ReportBufferLength);
     LogHidCall(L"HidD_SetFeature", details);
+    
+    // 检查是否是虚拟句柄或被劫持的真实句柄
+    bool isVirtualHandle = (HidDeviceObject == (HANDLE)0xCAFEBABE);
+    bool isHijackedHandle = IsHijackedHandle(HidDeviceObject);
+    
+    // 调试: 记录句柄信息和劫持列表
+    EnterCriticalSection(&g_hijackedHandlesCs);
+    size_t hijackedCount = g_hijackedHandles.size();
+    wchar_t handleList[512] = L"";
+    for (size_t i = 0; i < hijackedCount && i < 10; i++) {
+        wchar_t tmp[32];
+        swprintf_s(tmp, 32, L"0x%p ", g_hijackedHandles[i]);
+        wcscat_s(handleList, 512, tmp);
+    }
+    LeaveCriticalSection(&g_hijackedHandlesCs);
+    
+    wchar_t handleInfo[768];
+    swprintf_s(handleInfo, 768, L"[DEBUG SetFeature] Handle=0x%p, Virtual=%d, Match=%d, CacheValid=%d, HijackedCount=%zu, List=[%s]", 
+               HidDeviceObject, isVirtualHandle ? 1 : 0, 
+               isHijackedHandle ? 1 : 0, g_hidCache.isValid ? 1 : 0, 
+               hijackedCount, handleList);
+    LogMessage(handleInfo);
     
     // Output full hex dump
     if (ReportBufferLength > 0) {
@@ -738,16 +1000,24 @@ BOOLEAN WINAPI Hook_HidD_SetFeature(HANDLE HidDeviceObject, PVOID ReportBuffer, 
         }
     }
     
-    BOOLEAN result = Real_HidD_SetFeature(HidDeviceObject, ReportBuffer, ReportBufferLength);
+    BOOLEAN result;
     
-    if (!result) {
-        if (g_virtualDeviceEnabled) {
-            result = TRUE;
-            LogMessage(L"[VIRTUAL] HidD_SetFeature acknowledged without physical device");
-        } else {
-            wchar_t errMsg[128];
-            swprintf_s(errMsg, 128, L"  SetFeature failed, error: %d", GetLastError());
-            LogMessage(errMsg);
+    // 如果有缓存,直接成功(不检查句柄)
+    if (g_hidCache.isValid) {
+        result = TRUE;
+        LogMessage(L"[CACHE] HidD_SetFeature acknowledged (using cache)");
+    } else {
+        result = Real_HidD_SetFeature(HidDeviceObject, ReportBuffer, ReportBufferLength);
+        
+        if (!result) {
+            if (g_virtualDeviceEnabled) {
+                result = TRUE;
+                LogMessage(L"[VIRTUAL] HidD_SetFeature acknowledged without physical device");
+            } else {
+                wchar_t errMsg[128];
+                swprintf_s(errMsg, 128, L"  SetFeature failed, error: %d", GetLastError());
+                LogMessage(errMsg);
+            }
         }
     }
     
@@ -755,6 +1025,16 @@ BOOLEAN WINAPI Hook_HidD_SetFeature(HANDLE HidDeviceObject, PVOID ReportBuffer, 
 }
 
 BOOLEAN WINAPI Hook_HidD_FlushQueue(HANDLE HidDeviceObject) {
+    EnsureCacheLoaded();
+    
+    // 如果有缓存,直接成功(不检查句柄)
+    if (g_hidCache.isValid) {
+        wchar_t msg[256];
+        swprintf_s(msg, 256, L"FlushQueue success - Handle=0x%p (using cache)", HidDeviceObject);
+        LogHidCall(L"HidD_FlushQueue", msg);
+        return TRUE;
+    }
+    
     BOOLEAN result = Real_HidD_FlushQueue(HidDeviceObject);
     if (!result && g_virtualDeviceEnabled) {
         LogHidCall(L"HidD_FlushQueue", L"Virtual success");
@@ -765,6 +1045,18 @@ BOOLEAN WINAPI Hook_HidD_FlushQueue(HANDLE HidDeviceObject) {
 }
 
 BOOLEAN WINAPI Hook_HidD_GetPreparsedData(HANDLE HidDeviceObject, PHIDP_PREPARSED_DATA* PreparsedData) {
+    EnsureCacheLoaded();
+    
+    // 虚拟句柄：返回一个假的PreparsedData指针
+    if (HidDeviceObject == (HANDLE)0xCAFEBABE && g_hidCache.isValid) {
+        if (PreparsedData) {
+            // 返回一个非NULL的假指针（用于HidP_GetCaps）
+            *PreparsedData = (PHIDP_PREPARSED_DATA)0xDEADBEEF;
+        }
+        LogHidCall(L"HidD_GetPreparsedData", L"Virtual handle - returning fake pointer");
+        return TRUE;
+    }
+    
     LogHidCall(L"HidD_GetPreparsedData", L"Called");
     return Real_HidD_GetPreparsedData(HidDeviceObject, PreparsedData);
 }
@@ -774,6 +1066,263 @@ BOOLEAN WINAPI Hook_HidD_FreePreparsedData(PHIDP_PREPARSED_DATA PreparsedData) {
     return Real_HidD_FreePreparsedData(PreparsedData);
 }
 
+NTSTATUS WINAPI Hook_HidP_GetCaps(PHIDP_PREPARSED_DATA PreparsedData, PHIDP_CAPS Capabilities) {
+    EnsureCacheLoaded();
+    
+    // 检查是否是虚拟的PreparsedData指针
+    bool isVirtualData = (PreparsedData == (PHIDP_PREPARSED_DATA)0xDEADBEEF);
+    
+    if ((isVirtualData || g_hidCache.isValid) && Capabilities) {
+        // 返回缓存的Capabilities
+        ZeroMemory(Capabilities, sizeof(HIDP_CAPS));
+        Capabilities->Usage = g_hidCache.usage;
+        Capabilities->UsagePage = g_hidCache.usagePage;
+        Capabilities->InputReportByteLength = g_hidCache.inputReportLength;
+        Capabilities->OutputReportByteLength = g_hidCache.outputReportLength;
+        Capabilities->FeatureReportByteLength = g_hidCache.featureReportLength;
+        
+        wchar_t details[256];
+        swprintf_s(details, 256, L"Usage=0x%04X, UsagePage=0x%04X, Feature=%d bytes [CACHED]",
+                 Capabilities->Usage, Capabilities->UsagePage, Capabilities->FeatureReportByteLength);
+        LogHidCall(L"HidP_GetCaps", details);
+        return HIDP_STATUS_SUCCESS;
+    }
+    
+    NTSTATUS result = Real_HidP_GetCaps(PreparsedData, Capabilities);
+    LogHidCall(L"HidP_GetCaps", result == HIDP_STATUS_SUCCESS ? L"Success" : L"Failed");
+    return result;
+}
+
+BOOLEAN WINAPI Hook_HidD_GetProductString(HANDLE HidDeviceObject, PVOID Buffer, ULONG BufferLength) {
+    EnsureCacheLoaded();
+    
+    // 检查虚拟句柄或有缓存
+    bool isVirtualHandle = (HidDeviceObject == (HANDLE)0xCAFEBABE);
+    
+    if ((isVirtualHandle || g_hidCache.isValid) && g_hidCache.isValid && Buffer && BufferLength > 0) {
+        // 返回缓存的产品字符串
+        size_t len = wcslen(g_hidCache.productString);
+        size_t copyLen = (len + 1) * sizeof(wchar_t);
+        if (copyLen > BufferLength) copyLen = BufferLength;
+        
+        memcpy(Buffer, g_hidCache.productString, copyLen);
+        ((wchar_t*)Buffer)[BufferLength / sizeof(wchar_t) - 1] = L'\0';
+        
+        wchar_t details[256];
+        swprintf_s(details, 256, L"Product: %s [CACHED]", g_hidCache.productString);
+        LogHidCall(L"HidD_GetProductString", details);
+        return TRUE;
+    }
+    
+    BOOLEAN result = Real_HidD_GetProductString(HidDeviceObject, Buffer, BufferLength);
+    LogHidCall(L"HidD_GetProductString", result ? L"Success" : L"Failed");
+    return result;
+}
+
+BOOLEAN WINAPI Hook_HidD_GetSerialNumberString(HANDLE HidDeviceObject, PVOID Buffer, ULONG BufferLength) {
+    EnsureCacheLoaded();
+    
+    // 检查虚拟句柄或有缓存
+    bool isVirtualHandle = (HidDeviceObject == (HANDLE)0xCAFEBABE);
+    
+    if ((isVirtualHandle || g_hidCache.isValid) && g_hidCache.isValid && Buffer && BufferLength > 0) {
+        // 返回缓存的序列号字符串
+        size_t len = wcslen(g_hidCache.serialNumberString);
+        size_t copyLen = (len + 1) * sizeof(wchar_t);
+        if (copyLen > BufferLength) copyLen = BufferLength;
+        
+        memcpy(Buffer, g_hidCache.serialNumberString, copyLen);
+        ((wchar_t*)Buffer)[BufferLength / sizeof(wchar_t) - 1] = L'\0';
+        
+        wchar_t details[256];
+        swprintf_s(details, 256, L"Serial: %s [CACHED]", g_hidCache.serialNumberString);
+        LogHidCall(L"HidD_GetSerialNumberString", details);
+        return TRUE;
+    }
+    
+    BOOLEAN result = Real_HidD_GetSerialNumberString(HidDeviceObject, Buffer, BufferLength);
+    LogHidCall(L"HidD_GetSerialNumberString", result ? L"Success" : L"Failed");
+    return result;
+}
+
+// ==================== 设备枚举 Hook ====================
+
+BOOL WINAPI Hook_SetupDiEnumDeviceInterfaces(
+    HDEVINFO DeviceInfoSet,
+    PSP_DEVINFO_DATA DeviceInfoData,
+    CONST GUID* InterfaceClassGuid,
+    DWORD MemberIndex,
+    PSP_DEVICE_INTERFACE_DATA DeviceInterfaceData
+) {
+    EnsureCacheLoaded();
+    
+    // 检测新的枚举会话
+    if (DeviceInfoSet != g_lastDeviceInfoHandle || MemberIndex == 0) {
+        g_lastDeviceInfoHandle = DeviceInfoSet;
+        g_lastRealDeviceIndex = 0;
+        g_virtualDeviceInjected = false;
+        LogMessage(L"[ENUM] New device enumeration session started");
+    }
+    
+    // 先调用真实 API
+    BOOL result = Real_SetupDiEnumDeviceInterfaces(DeviceInfoSet, DeviceInfoData, InterfaceClassGuid, MemberIndex, DeviceInterfaceData);
+    
+    if (result) {
+        // 真实设备存在
+        g_lastRealDeviceIndex = MemberIndex;
+        wchar_t msg[256];
+        swprintf_s(msg, 256, L"[ENUM] Real device found at index %lu", MemberIndex);
+        LogMessage(msg);
+        return TRUE;
+    }
+    
+    // result == FALSE：没有更多真实设备
+    DWORD error = GetLastError();
+    
+    // 【禁用虚拟设备注入】因为已经劫持了第一个真实设备
+    // 如果启用了第一个设备劫持,就不需要再注入虚拟设备了
+    EnterCriticalSection(&g_hijackedHandlesCs);
+    bool hasHijackedHandles = !g_hijackedHandles.empty();
+    LeaveCriticalSection(&g_hijackedHandlesCs);
+    if (error == ERROR_NO_MORE_ITEMS && g_hidCache.isValid && !g_virtualDeviceInjected && !hasHijackedHandles) {
+        // 仅在没有劫持真实设备时才注入虚拟设备(当前已禁用)
+        // 注入虚拟设备!
+        g_virtualDeviceInjected = true;
+        
+        // 填充 DeviceInterfaceData
+        if (DeviceInterfaceData) {
+            DeviceInterfaceData->cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
+            DeviceInterfaceData->InterfaceClassGuid = *InterfaceClassGuid;
+            DeviceInterfaceData->Flags = SPINT_ACTIVE | SPINT_DEFAULT;
+            DeviceInterfaceData->Reserved = VIRTUAL_DEVICE_INDEX_MARKER;  // 标记为虚拟设备
+        }
+        
+        wchar_t msg[256];
+        swprintf_s(msg, 256, L"[ENUM] INJECTED virtual device at index %lu (after %lu real devices)", 
+                   MemberIndex, g_lastRealDeviceIndex + 1);
+        LogMessage(msg);
+        
+        SetLastError(ERROR_SUCCESS);
+        return TRUE;  // 告诉应用程序：还有一个设备！
+    }
+    
+    // 否则返回原始错误
+    SetLastError(error);
+    return FALSE;
+}
+
+BOOL WINAPI Hook_SetupDiGetDeviceInterfaceDetailW(
+    HDEVINFO DeviceInfoSet,
+    PSP_DEVICE_INTERFACE_DATA DeviceInterfaceData,
+    PSP_DEVICE_INTERFACE_DETAIL_DATA_W DeviceInterfaceDetailData,
+    DWORD DeviceInterfaceDetailDataSize,
+    PDWORD RequiredSize,
+    PSP_DEVINFO_DATA DeviceInfoData
+) {
+    EnsureCacheLoaded();
+    
+    // 检查是否是虚拟设备（通过 Reserved 字段判断）
+    bool isVirtualDevice = (DeviceInterfaceData && DeviceInterfaceData->Reserved == VIRTUAL_DEVICE_INDEX_MARKER);
+    
+    if (isVirtualDevice && g_hidCache.isValid) {
+        // 计算需要的大小
+        DWORD pathLen = (DWORD)wcslen(VIRTUAL_DEVICE_PATH);
+        DWORD requiredSize = offsetof(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath) + (pathLen + 1) * sizeof(WCHAR);
+        
+        if (RequiredSize) {
+            *RequiredSize = requiredSize;
+        }
+        
+        // 如果缓冲区足够，填充数据
+        if (DeviceInterfaceDetailData && DeviceInterfaceDetailDataSize >= requiredSize) {
+            DeviceInterfaceDetailData->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+            wcscpy_s(DeviceInterfaceDetailData->DevicePath, pathLen + 1, VIRTUAL_DEVICE_PATH);
+            
+            if (DeviceInfoData) {
+                DeviceInfoData->cbSize = sizeof(SP_DEVINFO_DATA);
+            }
+            
+            LogMessage(L"[ENUM] Returned virtual device path: " VIRTUAL_DEVICE_PATH);
+            SetLastError(ERROR_SUCCESS);
+            return TRUE;
+        }
+        
+        // 缓冲区不够
+        if (!DeviceInterfaceDetailData) {
+            // 第一次调用（查询大小）
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+            return FALSE;
+        }
+    }
+    
+    // 真实设备或缓存不可用，调用真实 API
+    return Real_SetupDiGetDeviceInterfaceDetailW(DeviceInfoSet, DeviceInterfaceData, 
+                                                   DeviceInterfaceDetailData, DeviceInterfaceDetailDataSize,
+                                                   RequiredSize, DeviceInfoData);
+}
+
+HANDLE WINAPI Hook_CreateFileW(
+    LPCWSTR lpFileName,
+    DWORD dwDesiredAccess,
+    DWORD dwShareMode,
+    LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+    DWORD dwCreationDisposition,
+    DWORD dwFlagsAndAttributes,
+    HANDLE hTemplateFile
+) {
+    EnsureCacheLoaded();
+    
+    // 调试: 记录所有 HID 设备打开
+    if (lpFileName && wcsstr(lpFileName, L"hid#")) {
+        wchar_t msg[768];
+        swprintf_s(msg, 768, L"[CREATEFILE DEBUG] Path: %s", lpFileName);
+        LogMessage(msg);
+    }
+    
+    // 检查是否是我们的虚拟设备路径
+    if (lpFileName && wcsstr(lpFileName, L"VID_096E&PID_0201") && wcsstr(lpFileName, L"VIRTUAL_CACHE")) {
+        if (g_hidCache.isValid) {
+            // 创建一个虚拟句柄（使用特殊值）
+            HANDLE virtualHandle = (HANDLE)0xCAFEBABE;  // 魔数标记
+            
+            wchar_t msg[512];
+            swprintf_s(msg, 512, L"[CREATEFILE] Virtual device opened: %s -> Handle 0x%p", lpFileName, virtualHandle);
+            LogMessage(msg);
+            
+            SetLastError(ERROR_SUCCESS);
+            return virtualHandle;
+        }
+    }
+    
+    // 真实文件/设备 - 先调用真实 API
+    HANDLE hDevice = Real_CreateFileW(lpFileName, dwDesiredAccess, dwShareMode, 
+                                       lpSecurityAttributes, dwCreationDisposition, 
+                                       dwFlagsAndAttributes, hTemplateFile);
+    
+    // 如果成功打开,且是目标 VID/PID 的 HID 设备路径,添加到劫持列表
+    if (hDevice != INVALID_HANDLE_VALUE && g_hidCache.isValid && lpFileName) {
+        // 检查是否是目标设备路径 (VID_096E&PID_0201)
+        if (wcsstr(lpFileName, L"hid#") && 
+            wcsstr(lpFileName, L"vid_096e") && 
+            wcsstr(lpFileName, L"pid_0201")) {
+            
+            InitHijackedHandles();
+            EnterCriticalSection(&g_hijackedHandlesCs);
+            if (std::find(g_hijackedHandles.begin(), g_hijackedHandles.end(), hDevice) == g_hijackedHandles.end()) {
+                g_hijackedHandles.push_back(hDevice);
+                wchar_t msg[512];
+                swprintf_s(msg, 512, L"[CREATEFILE] Target device opened, added handle 0x%p to hijack list (Path: %s)", 
+                          hDevice, lpFileName);
+                LogMessage(msg);
+            }
+            LeaveCriticalSection(&g_hijackedHandlesCs);
+        }
+    }
+    
+    return hDevice;
+}
+
+// 修改 HidD_GetAttributes 以支持虚拟句柄
 // 安装 Hook
 bool InstallHidHooks() {
     DetourTransactionBegin();
@@ -786,6 +1335,14 @@ bool InstallHidHooks() {
     DetourAttach(&(PVOID&)Real_HidD_FlushQueue, Hook_HidD_FlushQueue);
     DetourAttach(&(PVOID&)Real_HidD_GetPreparsedData, Hook_HidD_GetPreparsedData);
     DetourAttach(&(PVOID&)Real_HidD_FreePreparsedData, Hook_HidD_FreePreparsedData);
+    DetourAttach(&(PVOID&)Real_HidP_GetCaps, Hook_HidP_GetCaps);
+    DetourAttach(&(PVOID&)Real_HidD_GetProductString, Hook_HidD_GetProductString);
+    DetourAttach(&(PVOID&)Real_HidD_GetSerialNumberString, Hook_HidD_GetSerialNumberString);
+    
+    // 设备枚举 API
+    DetourAttach(&(PVOID&)Real_SetupDiEnumDeviceInterfaces, Hook_SetupDiEnumDeviceInterfaces);
+    DetourAttach(&(PVOID&)Real_SetupDiGetDeviceInterfaceDetailW, Hook_SetupDiGetDeviceInterfaceDetailW);
+    DetourAttach(&(PVOID&)Real_CreateFileW, Hook_CreateFileW);
     
     LONG error = DetourTransactionCommit();
     return (error == NO_ERROR);
@@ -803,6 +1360,14 @@ void UninstallHidHooks() {
     DetourDetach(&(PVOID&)Real_HidD_FlushQueue, Hook_HidD_FlushQueue);
     DetourDetach(&(PVOID&)Real_HidD_GetPreparsedData, Hook_HidD_GetPreparsedData);
     DetourDetach(&(PVOID&)Real_HidD_FreePreparsedData, Hook_HidD_FreePreparsedData);
+    DetourDetach(&(PVOID&)Real_HidP_GetCaps, Hook_HidP_GetCaps);
+    DetourDetach(&(PVOID&)Real_HidD_GetProductString, Hook_HidD_GetProductString);
+    DetourDetach(&(PVOID&)Real_HidD_GetSerialNumberString, Hook_HidD_GetSerialNumberString);
+    
+    // 设备枚举 API
+    DetourDetach(&(PVOID&)Real_SetupDiEnumDeviceInterfaces, Hook_SetupDiEnumDeviceInterfaces);
+    DetourDetach(&(PVOID&)Real_SetupDiGetDeviceInterfaceDetailW, Hook_SetupDiGetDeviceInterfaceDetailW);
+    DetourDetach(&(PVOID&)Real_CreateFileW, Hook_CreateFileW);
     
     DetourTransactionCommit();
 }
