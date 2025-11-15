@@ -12,20 +12,21 @@ add_executable(hid_launcher
 )
 
 # Test target executable (Rockey2 HID reader)
-add_executable(Xsjzb
-    test_launcher/test_target.cpp
-)
-
-target_link_libraries(Xsjzb PRIVATE
-    hid.lib
-    setupapi.lib
-    wininet.lib
-)
-
-target_compile_definitions(Xsjzb PRIVATE
-    UNICODE
-    _UNICODE
-)
+# Commented out - test file not present
+# add_executable(Xsjzb
+#     test_launcher/test_target.cpp
+# )
+# 
+# target_link_libraries(Xsjzb PRIVATE
+#     hid.lib
+#     setupapi.lib
+#     wininet.lib
+# )
+# 
+# target_compile_definitions(Xsjzb PRIVATE
+#     UNICODE
+#     _UNICODE
+# )
 
 # HID Hook DLL (injected DLL)
 add_library(hid_hook SHARED
@@ -71,9 +72,10 @@ set_target_properties(hid_launcher PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
-set_target_properties(Xsjzb PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
-)
+# Commented out - test target not built
+# set_target_properties(Xsjzb PROPERTIES
+#     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
+# )
 
 set_target_properties(hid_hook PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
@@ -81,9 +83,11 @@ set_target_properties(hid_hook PROPERTIES
 )
 
 # Install targets
-install(TARGETS hid_launcher Xsjzb hid_hook
+install(TARGETS hid_launcher hid_hook
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION bin
 )
-add_executable(test_hid_enum test_hid_enum.cpp)
-target_link_libraries(test_hid_enum hid setupapi)
+
+# Commented out - test targets not built
+# add_executable(test_hid_enum test_hid_enum.cpp)
+# target_link_libraries(test_hid_enum hid setupapi)
