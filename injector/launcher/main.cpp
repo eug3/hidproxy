@@ -97,7 +97,7 @@ void UpdateSector1Checksum(BYTE sector1[512], DWORD uid, DWORD hid, int year) {
 }
 
 // 生成虚拟缓存(无需真实设备)
-bool GenerateVirtualCache(const wchar_t* baseDir, const wchar_t* userName) {
+bool GenerateVirtualCache(const wchar_t* baseDir, const wchar_t* userName, DWORD userUid = 0) {
     wprintf(L"\n========================================\n");
     wprintf(L"  Generating Virtual HID Cache\n");
     wprintf(L"========================================\n\n");
@@ -105,6 +105,7 @@ bool GenerateVirtualCache(const wchar_t* baseDir, const wchar_t* userName) {
     wprintf(L"[DEBUG] Function entered: GenerateVirtualCache\n");
     wprintf(L"[DEBUG] baseDir parameter: '%s'\n", baseDir);
     wprintf(L"[DEBUG] userName parameter: '%s'\n", userName);
+    wprintf(L"[DEBUG] userUid parameter: %u (0x%08X)\n", userUid, userUid);
 
     // 创建 cache 子目录
     wchar_t cacheDir[MAX_PATH];
@@ -124,10 +125,25 @@ bool GenerateVirtualCache(const wchar_t* baseDir, const wchar_t* userName) {
         wprintf(L"[INFO] Cache directory created successfully\n");
     }
 
-    // 生成随机 HID 和 UID
-    srand((unsigned int)time(NULL));
-    DWORD deviceHid = ((DWORD)rand() << 16) | rand();
-    DWORD deviceUid = ((DWORD)rand() << 16) | rand();
+    // 生成 HID 和 UID
+    DWORD deviceHid;
+    DWORD deviceUid;
+    
+    if (userUid != 0) {
+        // 用户指定了 UID，只生成随机 HID
+        deviceUid = userUid;
+        srand((unsigned int)time(NULL));
+        deviceHid = ((DWORD)rand() << 16) | rand();
+        wprintf(L"[INFO] Using user-specified UID: %u (0x%08X)\n", deviceUid, deviceUid);
+        wprintf(L"[INFO] Generated random HID: 0x%08X\n", deviceHid);
+    } else {
+        // 随机生成 HID 和 UID
+        srand((unsigned int)time(NULL));
+        deviceHid = ((DWORD)rand() << 16) | rand();
+        deviceUid = ((DWORD)rand() << 16) | rand();
+        wprintf(L"[INFO] Generated random HID: 0x%08X\n", deviceHid);
+        wprintf(L"[INFO] Generated random UID: %u (0x%08X)\n", deviceUid, deviceUid);
+    }
 
     // 计算 SerialNumber (HID + (HID_reversed XOR UID))
     BYTE* hidBytes = (BYTE*)&deviceHid;
@@ -161,7 +177,7 @@ bool GenerateVirtualCache(const wchar_t* baseDir, const wchar_t* userName) {
     
     // 2. 构建完整字符串 (先用占位符校验和)
     offset = sprintf_s(sector1Template, sizeof(sector1Template),
-                      "%s  %d\xc4\xea\xb6\xc8\xd3\xda%d-01-01 12:00:00 %d\xc4\xea\xb6\xc8\xd3\xda%d-01-01 12:00:00  \xd2\xd1\xb1\xb8\xb0\xb8-\xd4\xda\xd3\xc3        000000000000000000000000000000000        \xb1\xb1\xbe\xa9\xb9\xdc\xb5\xc0\xbd\xa8\xc9\xe8\xb9\xc9\xb7\xdd\xd3\xd0\xcf\xde\xb9\xab\xcb\xbe",
+                      "%s  %d\xc4\xea\xb6\xc8\xd3\xda%d-01-01 12:00:00 %d\xc4\xea\xb6\xc8\xd3\xda%d-01-01 12:00:00 \xd2\xd1\xb1\xb8\xb0\xb8-\xd4\xda\xd3\xc3        000000000000000000000000000000000        \xb1\xb1\xbe\xa9\xb9\xdc\xb5\xc0\xbd\xa8\xc9\xe8\xb9\xc9\xb7\xdd\xd3\xd0\xcf\xde\xb9\xab\xcb\xbe",
                       userNameGB, currentYear, currentYear, nextYear, nextYear);
     
     // 3. 复制到 partition1
@@ -564,100 +580,10 @@ int wmain(int argc, wchar_t* argv[]) {
     }
     
     // DLL 总是在 launcher 同目录
-    swprintf_s(hookDllPath, L"%shid_hook.dll", launcherDir);
+    swprintf_s(hookDllPath, L"%sXsjzb_hook.dll", launcherDir);
 
-    // 生成缓存（在注入DLL之前）
-    wprintf(L"[CACHE] Checking cache status...\n");
-    
-    // 先检查是否已有缓存文件 (查找 cache 目录中的 *_device.cfg)
-    wchar_t cacheDir[MAX_PATH];
-    swprintf_s(cacheDir, L"%scache\\", launcherDir);
-    wchar_t searchPath[MAX_PATH];
-    swprintf_s(searchPath, L"%s*_device.cfg", cacheDir);
-    
-    WIN32_FIND_DATAW findData;
-    HANDLE hFind = FindFirstFileW(searchPath, &findData);
-    bool hasCacheFile = (hFind != INVALID_HANDLE_VALUE);
-    if (hFind != INVALID_HANDLE_VALUE) {
-        FindClose(hFind);
-    }
-    
-    if (hasCacheFile) {
-        wprintf(L"[OK] Existing cache found\n");
-        wprintf(L"[OK] Will use existing cache for offline operation\n\n");
-    } else {
-        // 没有缓存,尝试从真实设备生成
-        wprintf(L"[INFO] No cache found, trying to read from real device...\n");
-        bool cacheGenerated = GenerateCacheFromDevice(launcherDir);
-        
-        if (cacheGenerated) {
-            wprintf(L"[OK] Cache generated from real device\n\n");
-        } else {
-            // 没有真实设备也没有缓存,生成虚拟缓存
-            wprintf(L"\n========================================\n");
-            wprintf(L"[WARNING] No USB device detected!\n");
-            wprintf(L"[WARNING] No existing cache found!\n");
-            wprintf(L"========================================\n\n");
-            wprintf(L"Would you like to generate a virtual cache? (Y/N): ");
-            
-            wchar_t choice = _getwch();
-            wprintf(L"%c\n", choice);
-            
-            if (choice == L'Y' || choice == L'y') {
-                wprintf(L"\nPlease enter software key (4 Chinese characters): ");
-                
-                wchar_t userName[32] = {0};
-                
-                // 设置控制台为 Unicode 模式
-                _setmode(_fileno(stdin), _O_U16TEXT);
-                _setmode(_fileno(stdout), _O_U16TEXT);
-                
-                // 读取 Unicode 输入
-                if (fgetws(userName, _countof(userName), stdin) != NULL) {
-                    // 恢复正常模式
-                    _setmode(_fileno(stdin), _O_TEXT);
-                    _setmode(_fileno(stdout), _O_TEXT);
-                    
-                    // 去除末尾的换行符
-                    size_t len = wcslen(userName);
-                    if (len > 0 && userName[len - 1] == L'\n') {
-                        userName[len - 1] = L'\0';
-                        len--;
-                    }
-                    
-                    if (len > 0) {
-                        wprintf(L"[INFO] Generating cache for: %s\n", userName);
-                        wprintf(L"[DEBUG] Calling GenerateVirtualCache with launcherDir='%s'\n", launcherDir);
-                        
-                        if (GenerateVirtualCache(launcherDir, userName)) {
-                            wprintf(L"[OK] Virtual cache generated successfully!\n\n");
-                            // 缓存生成后不立即退出，继续检查目标程序
-                        } else {
-                            wprintf(L"\n[ERROR] Failed to generate virtual cache\n");
-                            wprintf(L"Press any key to exit...\n");
-                            _getwch();
-                            return 1;
-                        }
-                    } else {
-                        // 用户输入为空
-                        wprintf(L"\n[WARNING] No user name provided, cache generation cancelled.\n");
-                        wprintf(L"[INFO] Cannot run without cache. Exiting...\n\n");
-                        wprintf(L"Press any key to exit...\n");
-                        _getwch();
-                        return 1;
-                    }
-                } else {
-                    // 读取失败
-                    wprintf(L"\n[ERROR] Failed to read input.\n");
-                    wprintf(L"Press any key to exit...\n");
-                    _getwch();
-                    return 1;
-                }
-            } else {
-                wprintf(L"[WARNING] Application may show 'device not found' error\n\n");
-            }
-        }
-    }
+    wprintf(L"\n[INFO] HID Hook DLL will handle all device emulation dynamically\n");
+    wprintf(L"[INFO] No cache files needed - data read from target process memory\n\n");
 
     // 预加载系统DLL到当前进程（确保它们在内存中，减轻目标进程负担）
     wprintf(L"[PRELOAD] Loading system DLLs into memory...\n");
@@ -687,13 +613,13 @@ int wmain(int argc, wchar_t* argv[]) {
     wprintf(L"[OK] Target executable found\n");
 
     if (GetFileAttributesW(hookDllPath) == INVALID_FILE_ATTRIBUTES) {
-        wprintf(L"[ERROR] hid_hook.dll not found!\n");
+        wprintf(L"[ERROR] Xsjzb_hook.dll not found!\n");
         wprintf(L"  Path: %s\n\n", hookDllPath);
         wprintf(L"Press any key to exit...\n");
         _getwch();
         return 1;
     }
-    wprintf(L"[OK] hid_hook.dll found\n\n");
+    wprintf(L"[OK] Xsjzb_hook.dll found\n\n");
 
     wprintf(L"[STEP 1] Creating suspended process...\n");
     
@@ -832,7 +758,7 @@ int wmain(int argc, wchar_t* argv[]) {
     wprintf(L"========================================\n");
     wprintf(L"Injection complete!\n");
     wprintf(L"Target process is running (PID: %lu)\n", pi.dwProcessId);
-    wprintf(L"Check hid_hook.log for detailed activity.\n");
+    wprintf(L"Check Xsjzb_hook.log for detailed activity.\n");
     wprintf(L"========================================\n");
     return 0;
 }

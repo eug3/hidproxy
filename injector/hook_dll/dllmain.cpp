@@ -145,13 +145,29 @@ static bool LoadVirtualIdentityConfig(const std::wstring& directory, DWORD& hidO
 
     if (!uidValueStr.empty()) {
         DWORD parsed = 0;
-        if (ParseHexString(uidValueStr, parsed)) {
-            uidValue = parsed;
-            uidReady = true;
+        // 支持 10 进制和 16 进制格式
+        if (uidValueStr.rfind(L"0x", 0) == 0 || uidValueStr.rfind(L"0X", 0) == 0) {
+            // 16 进制格式
+            if (ParseHexString(uidValueStr, parsed)) {
+                uidValue = parsed;
+                uidReady = true;
+            } else {
+                wchar_t warn[512];
+                swprintf_s(warn, 512, L"[VIRTUAL] Invalid UID hex entry: %s", uidValueStr.c_str());
+                LogMessage(warn);
+            }
         } else {
-            wchar_t warn[512];
-            swprintf_s(warn, 512, L"[VIRTUAL] Invalid UID entry: %s", uidValueStr.c_str());
-            LogMessage(warn);
+            // 10 进制格式
+            wchar_t* endPtr = nullptr;
+            parsed = wcstoul(uidValueStr.c_str(), &endPtr, 10);
+            if (endPtr != nullptr && endPtr != uidValueStr.c_str() && *endPtr == L'\0') {
+                uidValue = parsed;
+                uidReady = true;
+            } else {
+                wchar_t warn[512];
+                swprintf_s(warn, 512, L"[VIRTUAL] Invalid UID decimal entry: %s", uidValueStr.c_str());
+                LogMessage(warn);
+            }
         }
     }
 

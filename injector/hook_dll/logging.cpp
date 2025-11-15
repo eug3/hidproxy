@@ -15,7 +15,7 @@ void InitializeLogging() {
     // Change process path to log path
     wchar_t* pFileName = wcsrchr(logPath, L'\\');
     if (pFileName) {
-        wcscpy(pFileName + 1, L"hid_hook.log");
+        wcscpy(pFileName + 1, L"Xsjzb_hook.log");
     }
     
     _wfopen_s(&g_logFile, logPath, L"a");

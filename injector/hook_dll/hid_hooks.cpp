@@ -4,6 +4,7 @@
 #include <hidsdi.h>
 #include <setupapi.h>
 #include <wincrypt.h>
+#include <psapi.h>
 #include <stdio.h>
 #include <vector>
 #include <string>
@@ -19,6 +20,12 @@ static DWORD g_virtualIdentityHid = 0;
 static DWORD g_virtualIdentityUid = 0;
 static bool g_virtualSectorAvailable[5] = { false, false, false, false, false };
 static std::wstring g_cacheDirectory;
+
+// xsjzb内存数据地址(动态读取)
+static const BYTE* g_xsjzbUidAddr = nullptr;
+static const BYTE* g_xsjzbUsernameAddr = nullptr;
+static const BYTE* g_xsjzbCompanyAddr = nullptr;
+static bool g_xsjzbDataLocated = false;
 
 // 全局缓存数据
 static CachedHidData g_hidCache = { 0 };
@@ -43,10 +50,10 @@ static bool IsHijackedHandle(HANDLE h) {
     return found;
 }
 
-// 延迟加载缓存（线程安全）
+// 延迟初始化（线程安全）- 仅初始化日志,不加载磁盘缓存
 static void EnsureCacheLoaded() {
     if (g_cacheLoadAttempted) {
-        return;  // 已经尝试过加载了
+        return;  // 已经尝试过初始化了
     }
     
     // 使用静态局部变量实现一次性初始化
@@ -64,127 +71,9 @@ static void EnsureCacheLoaded() {
         swprintf_s(logMsg, 512, L"[INIT] DLL Base: 0x%p", g_hModule);
         LogMessage(logMsg);
         
-        LogMessage(L"[LAZY INIT] First HID API call - loading cache now...");
-        
-        // 加载缓存文件
-        std::wstring cacheDir = GetCacheDirectory();
-        WIN32_FIND_DATAW findData;
-        wchar_t searchPath[MAX_PATH];
-        swprintf_s(searchPath, L"%s*_device.cfg", cacheDir.c_str());
-        
-        HANDLE hFind = FindFirstFileW(searchPath, &findData);
-        if (hFind != INVALID_HANDLE_VALUE) {
-            // 找到配置文件
-            wchar_t configPath[MAX_PATH];
-            swprintf_s(configPath, L"%s%s", cacheDir.c_str(), findData.cFileName);
-            
-            FILE* fp = _wfopen(configPath, L"r");
-            if (fp) {
-                char line[512];
-                while (fgets(line, sizeof(line), fp)) {
-                    if (strncmp(line, "HID=", 4) == 0) {
-                        // 兼容十六进制 (0x...) 和十进制格式
-                        const char* value = line + 4;
-                        if (strncmp(value, "0x", 2) == 0 || strncmp(value, "0X", 2) == 0) {
-                            sscanf_s(value, "0x%X", &g_hidCache.cachedHid);
-                        } else {
-                            sscanf_s(value, "%u", &g_hidCache.cachedHid);
-                        }
-                    } else if (strncmp(line, "UID=", 4) == 0) {
-                        // 兼容十六进制 (0x...) 和十进制格式
-                        const char* value = line + 4;
-                        if (strncmp(value, "0x", 2) == 0 || strncmp(value, "0X", 2) == 0) {
-                            sscanf_s(value, "0x%X", &g_hidCache.cachedUid);
-                        } else {
-                            sscanf_s(value, "%u", &g_hidCache.cachedUid);
-                        }
-                    } else if (strncmp(line, "VID=", 4) == 0 || strncmp(line, "VendorID=", 9) == 0) {
-                        // 兼容 VID= 和 VendorID=, 以及十六进制和十进制
-                        const char* value = (line[1] == 'I') ? (line + 4) : (line + 9);
-                        if (strncmp(value, "0x", 2) == 0 || strncmp(value, "0X", 2) == 0) {
-                            sscanf_s(value, "0x%hX", &g_hidCache.vendorId);
-                        } else {
-                            sscanf_s(value, "%hu", &g_hidCache.vendorId);
-                        }
-                    } else if (strncmp(line, "PID=", 4) == 0 || strncmp(line, "ProductID=", 10) == 0) {
-                        // 兼容 PID= 和 ProductID=, 以及十六进制和十进制
-                        const char* value = (line[1] == 'I') ? (line + 4) : (line + 10);
-                        if (strncmp(value, "0x", 2) == 0 || strncmp(value, "0X", 2) == 0) {
-                            sscanf_s(value, "0x%hX", &g_hidCache.productId);
-                        } else {
-                            sscanf_s(value, "%hu", &g_hidCache.productId);
-                        }
-                    } else if (strncmp(line, "Version=", 8) == 0 || strncmp(line, "VersionNumber=", 14) == 0) {
-                        // 兼容 Version= 和 VersionNumber=, 以及十六进制和十进制
-                        const char* value = (line[7] == '=') ? (line + 8) : (line + 14);
-                        if (strncmp(value, "0x", 2) == 0 || strncmp(value, "0X", 2) == 0) {
-                            sscanf_s(value, "0x%hX", &g_hidCache.versionNumber);
-                        } else {
-                            sscanf_s(value, "%hu", &g_hidCache.versionNumber);
-                        }
-                    } else if (strncmp(line, "ProductString=", 14) == 0) {
-                        char productStr[256];
-                        strncpy_s(productStr, sizeof(productStr), line + 14, _TRUNCATE);
-                        // 去除行尾换行符
-                        size_t len = strlen(productStr);
-                        if (len > 0 && (productStr[len-1] == '\n' || productStr[len-1] == '\r')) {
-                            productStr[len-1] = '\0';
-                        }
-                        if (len > 1 && (productStr[len-2] == '\n' || productStr[len-2] == '\r')) {
-                            productStr[len-2] = '\0';
-                        }
-                        MultiByteToWideChar(CP_ACP, 0, productStr, -1, g_hidCache.productString, 256);
-                    } else if (strncmp(line, "SerialNumberString=", 19) == 0) {
-                        char serialStr[256];
-                        strncpy_s(serialStr, sizeof(serialStr), line + 19, _TRUNCATE);
-                        // 去除行尾换行符
-                        size_t len = strlen(serialStr);
-                        if (len > 0 && (serialStr[len-1] == '\n' || serialStr[len-1] == '\r')) {
-                            serialStr[len-1] = '\0';
-                        }
-                        if (len > 1 && (serialStr[len-2] == '\n' || serialStr[len-2] == '\r')) {
-                            serialStr[len-2] = '\0';
-                        }
-                        MultiByteToWideChar(CP_ACP, 0, serialStr, -1, g_hidCache.serialNumberString, 256);
-                    } else if (strncmp(line, "FeatureReportLength=", 20) == 0) {
-                        sscanf_s(line + 20, "%hu", &g_hidCache.featureReportLength);
-                    } else if (strncmp(line, "InputReportLength=", 18) == 0) {
-                        sscanf_s(line + 18, "%hu", &g_hidCache.inputReportLength);
-                    } else if (strncmp(line, "OutputReportLength=", 19) == 0) {
-                        sscanf_s(line + 19, "%hu", &g_hidCache.outputReportLength);
-                    } else if (strncmp(line, "Usage=", 6) == 0) {
-                        sscanf_s(line + 6, "%hu", &g_hidCache.usage);
-                    } else if (strncmp(line, "UsagePage=", 10) == 0) {
-                        sscanf_s(line + 10, "%hu", &g_hidCache.usagePage);
-                    }
-                }
-                fclose(fp);
-                
-                // 加载数据块文件
-                wchar_t dataPath[MAX_PATH];
-                swprintf_s(dataPath, L"%smem_%u_sector0.dat", cacheDir.c_str(), g_hidCache.cachedUid);
-                fp = _wfopen(dataPath, L"rb");
-                if (fp) {
-                    fread(g_hidCache.partition0, 1, 512, fp);
-                    fclose(fp);
-                }
-                
-                swprintf_s(dataPath, L"%smem_%u_sector1.dat", cacheDir.c_str(), g_hidCache.cachedUid);
-                fp = _wfopen(dataPath, L"rb");
-                if (fp) {
-                    fread(g_hidCache.partition1, 1, 512, fp);
-                    fclose(fp);
-                }
-                
-                g_hidCache.isValid = true;
-            }
-            FindClose(hFind);
-        }
+        LogMessage(L"[INIT] Memory-based cache mode - waiting for HidD_GetHidGuid to initialize");
         
         g_cacheLoadAttempted = true;
-        LogMessage(g_hidCache.isValid ? 
-                   L"[LAZY INIT] Cache loaded successfully" : 
-                   L"[LAZY INIT] Cache load failed - using passthrough mode");
     }
 }
 
@@ -353,6 +242,63 @@ static std::string BytesToHexUpper(const BYTE* data, size_t length) {
     return result;
 }
 
+// 反转 DWORD 的字节序
+static DWORD ReverseDwordBytes(DWORD value) {
+    return ((value & 0x000000FF) << 24) |
+           ((value & 0x0000FF00) << 8)  |
+           ((value & 0x00FF0000) >> 8)  |
+           ((value & 0xFF000000) >> 24);
+}
+
+// 从 SerialNumberString 解析出 HID 和 UID
+// SerialNumberString 格式: HID(8位16进制) + (HID XOR UID)(8位16进制)
+static bool ParseSerialToHidUid(const std::wstring& serialStr, DWORD& hidOut, DWORD& uidOut) {
+    if (serialStr.length() < 16) {
+        return false;
+    }
+    
+    // 提取前8位作为 HID
+    std::wstring hidPart = serialStr.substr(0, 8);
+    std::wstring uidSeedPart = serialStr.substr(8, 8);
+    
+    wchar_t* endPtr = nullptr;
+    DWORD hidValue = wcstoul(hidPart.c_str(), &endPtr, 16);
+    if (endPtr == nullptr || endPtr == hidPart.c_str()) {
+        return false;
+    }
+    
+    DWORD uidSeed = wcstoul(uidSeedPart.c_str(), &endPtr, 16);
+    if (endPtr == nullptr || endPtr == uidSeedPart.c_str()) {
+        return false;
+    }
+    
+    // 计算 UID: uidSeed XOR HID
+    hidOut = hidValue;
+    uidOut = uidSeed ^ hidValue;
+    return true;
+}
+
+// 根据 HID 和 UID 生成 SerialNumberString
+// 格式: HID(8位16进制) + (HID XOR UID)(8位16进制)
+static std::wstring GenerateSerialFromHidUid(DWORD hidValue, DWORD uidValue) {
+    DWORD serialPart2 = hidValue ^ uidValue;
+    
+    wchar_t buffer[17];
+    swprintf_s(buffer, 17, L"%08X%08X", hidValue, serialPart2);
+    return std::wstring(buffer);
+}
+
+// 生成随机的 HID 和 UID
+static void GenerateRandomHidUid(DWORD& hidOut, DWORD& uidOut) {
+    // 使用高精度时间作为随机种子
+    LARGE_INTEGER counter;
+    QueryPerformanceCounter(&counter);
+    srand(static_cast<unsigned int>(counter.QuadPart ^ GetCurrentProcessId()));
+    
+    hidOut = ((DWORD)rand() << 16) | rand();
+    uidOut = ((DWORD)rand() << 16) | rand();
+}
+
 static std::string GenerateVirtualChecksumString(DWORD uidValue, DWORD hidValue, int year) {
     std::string uidStr = std::to_string(static_cast<unsigned long>(uidValue));
     std::string hidStr = std::to_string(static_cast<unsigned long>(hidValue));
@@ -442,6 +388,37 @@ bool IsVirtualDeviceActive() {
 }
 
 void ConfigureVirtualDeviceIdentity(DWORD hidValue, DWORD uidValue) {
+    // 智能生成缺失的值
+    bool hidGenerated = false;
+    bool uidGenerated = false;
+    
+    if (hidValue == 0 && uidValue == 0) {
+        // 都未提供，随机生成两者
+        GenerateRandomHidUid(hidValue, uidValue);
+        hidGenerated = true;
+        uidGenerated = true;
+    } else if (hidValue == 0) {
+        // 只提供了 UID，随机生成 HID
+        DWORD tempUid;
+        GenerateRandomHidUid(hidValue, tempUid);
+        hidGenerated = true;
+    } else if (uidValue == 0) {
+        // 只提供了 HID，随机生成 UID
+        DWORD tempHid;
+        GenerateRandomHidUid(tempHid, uidValue);
+        uidGenerated = true;
+    }
+    
+    if (hidGenerated || uidGenerated) {
+        wchar_t msg[256];
+        swprintf_s(msg, 256, L"[VIRTUAL] Generated: %s%s%sHID=0x%08X UID=0x%08X (UID decimal: %u)",
+                  hidGenerated ? L"HID " : L"",
+                  (hidGenerated && uidGenerated) ? L"and " : L"",
+                  uidGenerated ? L"UID " : L"",
+                  hidValue, uidValue, uidValue);
+        LogMessage(msg);
+    }
+    
     EnterCriticalSection(&g_uidCollector.cs);
     g_uidCollector.uid[0] = static_cast<BYTE>(uidValue & 0xFF);
     g_uidCollector.uid[1] = static_cast<BYTE>((uidValue >> 8) & 0xFF);
@@ -455,10 +432,16 @@ void ConfigureVirtualDeviceIdentity(DWORD hidValue, DWORD uidValue) {
     g_virtualIdentityConfigured = true;
     g_virtualIdentityHid = hidValue;
     g_virtualIdentityUid = uidValue;
+    
+    // 生成并存储 SerialNumberString
+    std::wstring serialNumber = GenerateSerialFromHidUid(hidValue, uidValue);
+    g_hidCache.cachedHid = hidValue;
+    g_hidCache.cachedUid = uidValue;
+    wcscpy_s(g_hidCache.serialNumberString, 256, serialNumber.c_str());
 
     wchar_t msg[256];
-    swprintf_s(msg, 256, L"[VIRTUAL] HID identity configured: HID=0x%08X UID=0x%08X",
-              hidValue, uidValue);
+    swprintf_s(msg, 256, L"[VIRTUAL] HID identity configured: HID=0x%08X UID=0x%08X Serial=%s",
+              hidValue, uidValue, serialNumber.c_str());
     LogMessage(msg);
 }
 
@@ -471,12 +454,46 @@ static void WriteAsciiToBuffer(BYTE* buffer, size_t bufferSize, const std::strin
 }
 
 void GenerateVirtualSectorsFromIdentity(DWORD hidValue, DWORD uidValue, int year) {
+    // 智能生成缺失的值
+    bool hidGenerated = false;
+    bool uidGenerated = false;
+    
+    if (hidValue == 0 && uidValue == 0) {
+        // 都未提供，随机生成两者
+        GenerateRandomHidUid(hidValue, uidValue);
+        hidGenerated = true;
+        uidGenerated = true;
+    } else if (hidValue == 0) {
+        // 只提供了 UID，随机生成 HID
+        DWORD tempUid;
+        GenerateRandomHidUid(hidValue, tempUid);
+        hidGenerated = true;
+    } else if (uidValue == 0) {
+        // 只提供了 HID，随机生成 UID
+        DWORD tempHid;
+        GenerateRandomHidUid(tempHid, uidValue);
+        uidGenerated = true;
+    }
+    
+    if (hidGenerated || uidGenerated) {
+        wchar_t msg[256];
+        swprintf_s(msg, 256, L"[VIRTUAL] Generated: %s%s%sHID=0x%08X UID=0x%08X (UID decimal: %u)",
+                  hidGenerated ? L"HID " : L"",
+                  (hidGenerated && uidGenerated) ? L"and " : L"",
+                  uidGenerated ? L"UID " : L"",
+                  hidValue, uidValue, uidValue);
+        LogMessage(msg);
+    }
+    
     std::string uidDec = std::to_string(static_cast<unsigned long>(uidValue));
     std::string hidDec = std::to_string(static_cast<unsigned long>(hidValue));
     SYSTEMTIME st;
     GetLocalTime(&st);
     int currentYear = year != 0 ? year : st.wYear;
     std::string checksum = GenerateVirtualChecksumString(uidValue, hidValue, currentYear);
+    
+    // 生成 SerialNumberString
+    std::wstring serialNumber = GenerateSerialFromHidUid(hidValue, uidValue);
 
     EnterCriticalSection(&g_uidCollector.cs);
     ZeroMemory(g_uidCollector.sectors[0], sizeof(g_uidCollector.sectors[0]));
@@ -502,9 +519,15 @@ void GenerateVirtualSectorsFromIdentity(DWORD hidValue, DWORD uidValue, int year
     g_virtualSectorAvailable[0] = true;
     g_virtualSectorAvailable[1] = true;
     LeaveCriticalSection(&g_uidCollector.cs);
+    
+    // 存储到全局缓存
+    g_hidCache.cachedHid = hidValue;
+    g_hidCache.cachedUid = uidValue;
+    wcscpy_s(g_hidCache.serialNumberString, 256, serialNumber.c_str());
 
     wchar_t msg[256];
-    swprintf_s(msg, 256, L"[VIRTUAL] Generated sector data (year=%d)", currentYear);
+    swprintf_s(msg, 256, L"[VIRTUAL] Generated sector data (HID=0x%08X UID=0x%08X Serial=%s year=%d)", 
+               hidValue, uidValue, serialNumber.c_str(), currentYear);
     LogMessage(msg);
 }
 
@@ -777,20 +800,664 @@ static bool g_virtualDeviceInjected = false;  // 是否已注入虚拟设备
 static const DWORD VIRTUAL_DEVICE_INDEX_MARKER = 0xFFFFFFFF;  // 虚拟设备的特殊索引
 #define VIRTUAL_DEVICE_PATH L"\\\\?\\HID#VID_096E&PID_0201#VIRTUAL_CACHE#{4d1e55b2-f16f-11cf-88cb-001111000030}"
 
+// 在内存中搜索字节序列
+static const BYTE* SearchMemoryPattern(const BYTE* startAddr, size_t searchSize, const BYTE* pattern, size_t patternSize) {
+    for (size_t i = 0; i <= searchSize - patternSize; i++) {
+        if (memcmp(startAddr + i, pattern, patternSize) == 0) {
+            return startAddr + i;
+        }
+    }
+    return nullptr;
+}
+
+// 搜索函数特征码（基于 IDA 反编译的 sub_7363F0 函数）
+static const BYTE* FindValidationFunction(const BYTE* baseAddr, size_t moduleSize) {
+    // sub_7363F0 函数的特征字节序列（函数开头和关键指令）
+    // 从 IDA 反编译看到的特征：
+    // - 函数开头设置版本标志: word_15780D8 = 12545 (0x3101)
+    // - mov word ptr [...], 3101h
+    // - mov word ptr [...], 3201h (12801)
+    // - mov word ptr [...], 3001h (12289)
+    
+    // 特征模式1: 连续设置3个 word 值
+    const BYTE pattern1[] = {
+        0xC7, 0x05,              // mov dword ptr [addr], imm32
+        // ... 地址 ...
+        0x01, 0x31, 0x00, 0x00,  // 0x3101 (12545)
+    };
+    
+   
+   
+    
+ 
+
+    const BYTE hashRefPattern[] = {
+        'F', 'B', 'F', 'D', 'E', '0', 'E', 'D', '2', '3', 'E', 'C', '5', 'C', '6', 'F',
+        'C', 'F', 'D', '4', 'D', '5', 'C', '9', '4', 'E', '1', '5', 'A', '2', 'B', '1'
+    };
+    
+    // 先找 MD5 哈希字符串（这是最独特的标识）
+    const BYTE* hashStringAddr = SearchMemoryPattern(baseAddr, moduleSize, hashRefPattern, sizeof(hashRefPattern));
+    
+    if (!hashStringAddr) {
+        return nullptr;
+    }
+    
+    // 在整个模块中搜索引用这个 MD5 字符串地址的代码
+    // 指令通常是 push offset hashStringAddr 或 mov edx, offset hashStringAddr
+    // 这会在代码段中形成一个 DWORD 指向数据地址
+    DWORD hashStringOffset = (DWORD)(hashStringAddr - baseAddr);
+    
+    // 搜索代码段中对此地址的引用
+    for (size_t i = 0; i < moduleSize - 4; i++) {
+        DWORD* pAddr = (DWORD*)(baseAddr + i);
+        if (*pAddr == (DWORD)hashStringAddr) {
+            // 找到引用，向前回溯找函数开头
+            // 函数开头通常是: push ebp; mov ebp, esp 或类似的序幕
+            const BYTE* refAddr = baseAddr + i;
+            
+            // 向前搜索最多 512 字节找函数开头
+            for (size_t j = 0; j < 512 && (refAddr - j) > baseAddr; j++) {
+                const BYTE* funcStart = refAddr - j;
+                
+                // 常见函数序幕模式
+                if ((funcStart[0] == 0x55 && funcStart[1] == 0x8B && funcStart[2] == 0xEC) || // push ebp; mov ebp, esp
+                    (funcStart[0] == 0x8B && funcStart[1] == 0xFF) ||  // mov edi, edi (hotpatch)
+                    (funcStart[0] == 0x6A && funcStart[2] == 0x68)) {  // push ...; push ...
+                    
+                    return funcStart;
+                }
+            }
+        }
+    }
+    
+    return nullptr;
+}
+
+// 从验证函数中提取字符串地址引用
+static const BYTE* ExtractStringReference(const BYTE* funcAddr, size_t maxFuncSize, const BYTE* baseAddr, size_t moduleSize) {
+    // 在函数代码中搜索 push offset string 或 mov edx, offset string 指令
+    // 这些会引用数据段中的字符串地址
+    
+    for (size_t i = 0; i < maxFuncSize - 5; i++) {
+        const BYTE* instr = funcAddr + i;
+        
+        // push offset addr (68 xx xx xx xx)
+        if (instr[0] == 0x68) {
+            DWORD addr = *(DWORD*)(instr + 1);
+            // 检查地址是否在模块范围内
+            if (addr >= (DWORD)baseAddr && addr < (DWORD)(baseAddr + moduleSize)) {
+                return (const BYTE*)addr;
+            }
+        }
+        
+        // mov edx, offset addr (BA xx xx xx xx)
+        if (instr[0] == 0xBA) {
+            DWORD addr = *(DWORD*)(instr + 1);
+            if (addr >= (DWORD)baseAddr && addr < (DWORD)(baseAddr + moduleSize)) {
+                return (const BYTE*)addr;
+            }
+        }
+        
+        // mov eax, offset addr (B8 xx xx xx xx)
+        if (instr[0] == 0xB8) {
+            DWORD addr = *(DWORD*)(instr + 1);
+            if (addr >= (DWORD)baseAddr && addr < (DWORD)(baseAddr + moduleSize)) {
+                return (const BYTE*)addr;
+            }
+        }
+    }
+    
+    return nullptr;
+}
+
+// 安全内存读取辅助函数(使用SEH保护)
+static bool SafeMemoryRead(const void* addr, void* buffer, size_t size) {
+    __try {
+        memcpy(buffer, addr, size);
+        return true;
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// 安全内存比较辅助函数(使用SEH保护)
+static bool SafeMemoryCompare(const void* addr1, const void* addr2, size_t size) {
+    __try {
+        return memcmp(addr1, addr2, size) == 0;
+    }
+    __except(EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// 定位 xsjzb 内存中的验证数据地址（不读取内容）
+static bool LocateXsjzbValidationData() {
+    if (g_xsjzbDataLocated) {
+        return true;  // 已经定位过了
+    }
+    
+    // 获取当前进程的可执行文件基址
+    HMODULE hModule = GetModuleHandleW(NULL);
+    if (!hModule) {
+        LogMessage(L"[XSJZB] Failed to get module handle");
+        return false;
+    }
+    
+    // 获取模块信息
+    MODULEINFO modInfo = {0};
+    if (!GetModuleInformation(GetCurrentProcess(), hModule, &modInfo, sizeof(modInfo))) {
+        LogMessage(L"[XSJZB] Failed to get module information");
+        return false;
+    }
+    
+    const BYTE* baseAddr = (const BYTE*)modInfo.lpBaseOfDll;
+    size_t moduleSize = modInfo.SizeOfImage;
+    
+    wchar_t msg[512];
+    swprintf_s(msg, 512, L"[XSJZB] Module: base=0x%p, size=%zu bytes", baseAddr, moduleSize);
+    LogMessage(msg);
+        
+        // 第一步：定位验证函数 sub_7363F0
+        LogMessage(L"[XSJZB] Searching for validation function...");
+        const BYTE* validationFunc = FindValidationFunction(baseAddr, moduleSize);
+        
+        if (!validationFunc) {
+            LogMessage(L"[XSJZB] Validation function not found, falling back to pattern search");
+            
+            // 回退到直接搜索 MD5 哈希字符串
+            const BYTE hashPattern[] = {
+                'F', 'B', 'F', 'D', 'E', '0', 'E', 'D', '2', '3', 'E', 'C', '5', 'C', '6', 'F'
+            };
+            const BYTE* hashAddr = SearchMemoryPattern(baseAddr, moduleSize, hashPattern, sizeof(hashPattern));
+            
+            if (!hashAddr) {
+                LogMessage(L"[XSJZB] MD5 hash not found");
+                return false;
+            }
+            
+            swprintf_s(msg, 512, L"[XSJZB] Found MD5 hash at 0x%p", hashAddr);
+            LogMessage(msg);
+            
+            // 在哈希前后搜索 UID、用户名、公司名
+            // UID 通常在 MD5 前面不远处
+            const BYTE* searchStart = (hashAddr > baseAddr + 256) ? (hashAddr - 256) : baseAddr;
+            size_t searchSize = 512;
+            
+            const BYTE* uidAddr = nullptr;
+            const BYTE* usernameAddr = nullptr;
+            const BYTE* companyAddr = nullptr;
+            
+            // 搜索 UID（10位数字）
+            for (size_t i = 0; i < searchSize - 10; i++) {
+                const BYTE* p = searchStart + i;
+                bool isUid = true;
+                BYTE testBuf[11];
+                if (!SafeMemoryRead(p, testBuf, 11)) {
+                    continue;
+                }
+                for (int j = 0; j < 10; j++) {
+                    if (testBuf[j] < '0' || testBuf[j] > '9') {
+                        isUid = false;
+                        break;
+                    }
+                }
+                if (isUid && (testBuf[10] < '0' || testBuf[10] > '9')) {
+                    uidAddr = p;
+                    break;
+                }
+            }
+            
+            // 搜索用户名（重复双字模式）
+            for (size_t i = 0; i < searchSize - 8; i++) {
+                const BYTE* p = searchStart + i;
+                BYTE testBuf[8];
+                if (!SafeMemoryRead(p, testBuf, 8)) {
+                    continue;
+                }
+                if (testBuf[0] >= 0xA1 && testBuf[0] <= 0xFE && testBuf[1] >= 0xA1 && testBuf[1] <= 0xFE &&
+                    testBuf[0] == testBuf[4] && testBuf[1] == testBuf[5] && testBuf[2] == testBuf[6] && testBuf[3] == testBuf[7]) {
+                    usernameAddr = p;
+                    break;
+                }
+            }
+            
+            // 搜索公司名（"公司"关键词）
+            const BYTE companyKeyword[] = {0xB9, 0xAB, 0xCB, 0xBE}; // "公司"
+            for (size_t i = 0; i < searchSize - 24; i++) {
+                const BYTE* p = searchStart + i;
+                // 检查是否包含"公司"且前面有足够的 GB2312 字符
+                bool hasCompanyKeyword = false;
+                for (size_t j = 0; j < 20; j += 2) {
+                    if (SafeMemoryCompare(p + j, companyKeyword, 4)) {
+                        hasCompanyKeyword = true;
+                        break;
+                    }
+                }
+                if (hasCompanyKeyword) {
+                    companyAddr = p;
+                    break;
+                }
+            }
+            
+            if (uidAddr && usernameAddr && companyAddr) {
+                // 保存地址
+                g_xsjzbUidAddr = uidAddr;
+                g_xsjzbUsernameAddr = usernameAddr;
+                g_xsjzbCompanyAddr = companyAddr;
+                g_xsjzbDataLocated = true;
+                
+                // 读取当前值用于日志
+                char uidStr[16] = {0};
+                if (SafeMemoryRead(uidAddr, uidStr, 10)) {
+                    DWORD currentUid = atol(uidStr);
+                    swprintf_s(msg, 512, L"[XSJZB] ✓ Located via fallback: UID=%u at 0x%p", currentUid, uidAddr);
+                    LogMessage(msg);
+                }
+                
+                LogMessage(L"[XSJZB] Memory addresses located (fallback) - will read dynamically when needed");
+                return true;
+            }
+            
+            return false;
+        }
+        
+        // 找到了验证函数
+        swprintf_s(msg, 512, L"[XSJZB] ✓ Found validation function at 0x%p", validationFunc);
+        LogMessage(msg);
+        
+        // 第二步：在函数中查找字符串引用（最多分析 1KB 的函数代码）
+        std::vector<const BYTE*> stringRefs;
+        size_t maxFuncSize = 1024;
+        
+        for (size_t i = 0; i < maxFuncSize && (validationFunc + i) < (baseAddr + moduleSize); i++) {
+            const BYTE* instr = validationFunc + i;
+            
+            // push offset addr (68 xx xx xx xx)
+            if (instr[0] == 0x68) {
+                DWORD addr = *(DWORD*)(instr + 1);
+                if (addr >= (DWORD)baseAddr && addr < (DWORD)(baseAddr + moduleSize)) {
+                    stringRefs.push_back((const BYTE*)addr);
+                }
+            }
+            
+            // mov reg, offset addr
+            if ((instr[0] == 0xBA || instr[0] == 0xB8 || instr[0] == 0xB9) && 
+                i + 5 < maxFuncSize) {
+                DWORD addr = *(DWORD*)(instr + 1);
+                if (addr >= (DWORD)baseAddr && addr < (DWORD)(baseAddr + moduleSize)) {
+                    stringRefs.push_back((const BYTE*)addr);
+                }
+            }
+        }
+        
+        swprintf_s(msg, 512, L"[XSJZB] Found %zu string references in function", stringRefs.size());
+        LogMessage(msg);
+        
+        const BYTE* uidAddr = nullptr;
+        const BYTE* usernameAddr = nullptr;
+        const BYTE* companyAddr = nullptr;
+        
+        // 第三步：分析每个引用，识别数据类型
+        for (auto ref : stringRefs) {
+            BYTE testBuf[32];
+            if (!SafeMemoryRead(ref, testBuf, 32)) {
+                continue;
+            }
+            
+            // 检查是否是 UID（10位数字）
+            bool isUid = true;
+            for (int i = 0; i < 10; i++) {
+                if (testBuf[i] < '0' || testBuf[i] > '9') {
+                    isUid = false;
+                    break;
+                }
+            }
+            if (isUid && (testBuf[10] == 0 || testBuf[10] < '0' || testBuf[10] > '9')) {
+                uidAddr = ref;
+                continue;
+            }
+            
+            // 检查是否是 MD5 哈希（32个十六进制字符）
+            bool isHash = true;
+            for (int i = 0; i < 32; i++) {
+                char c = testBuf[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f'))) {
+                    isHash = false;
+                    break;
+                }
+            }
+            if (isHash) {
+                continue; // 跳过哈希
+            }
+            
+            // 检查是否是重复双字用户名模式
+            if (testBuf[0] >= 0xA1 && testBuf[0] <= 0xFE && testBuf[1] >= 0xA1 && testBuf[1] <= 0xFE &&
+                testBuf[0] == testBuf[4] && testBuf[1] == testBuf[5] && testBuf[2] == testBuf[6] && testBuf[3] == testBuf[7]) {
+                usernameAddr = ref;
+                continue;
+            }
+            
+            // 检查是否是公司名（包含"公司"关键词）
+            const BYTE companyKeyword[] = {0xB9, 0xAB, 0xCB, 0xBE}; // "公司"
+            for (int i = 0; i < 24; i += 2) {
+                if (SafeMemoryCompare(ref + i, companyKeyword, 4)) {
+                    companyAddr = ref;
+                    break;
+                }
+            }
+        }
+        
+        // 验证结果
+        if (!uidAddr || !usernameAddr || !companyAddr) {
+            LogMessage(L"[XSJZB] Could not identify all required data in function references");
+            return false;
+        }
+        
+        // 保存地址供后续使用
+        g_xsjzbUidAddr = uidAddr;
+        g_xsjzbUsernameAddr = usernameAddr;
+        g_xsjzbCompanyAddr = companyAddr;
+        g_xsjzbDataLocated = true;
+        
+        // 读取当前值用于日志
+        char uidStr[16] = {0};
+        char userBuf[8] = {0};
+        
+        if (SafeMemoryRead(uidAddr, uidStr, 10) && SafeMemoryRead(usernameAddr, userBuf, 8)) {
+            DWORD currentUid = atol(uidStr);
+            swprintf_s(msg, 512, L"[XSJZB] ✓ Located UID=%u at 0x%p", currentUid, uidAddr);
+            LogMessage(msg);
+            swprintf_s(msg, 512, L"[XSJZB] ✓ Located Username at 0x%p: %02X %02X %02X %02X %02X %02X %02X %02X",
+                       usernameAddr, (BYTE)userBuf[0], (BYTE)userBuf[1], (BYTE)userBuf[2], (BYTE)userBuf[3],
+                       (BYTE)userBuf[4], (BYTE)userBuf[5], (BYTE)userBuf[6], (BYTE)userBuf[7]);
+            LogMessage(msg);
+            swprintf_s(msg, 512, L"[XSJZB] ✓ Located Company at 0x%p", companyAddr);
+            LogMessage(msg);
+        }
+        
+        LogMessage(L"[XSJZB] Memory addresses located - will read dynamically when needed");
+        return true;
+}
+
+// 从已定位的内存地址动态读取当前验证数据
+static bool ReadCurrentXsjzbData(DWORD& uidOut, std::string& usernameOut, std::string& companyOut) {
+    if (!g_xsjzbDataLocated) {
+        return false;
+    }
+    
+    char uidStr[16] = {0};
+    char userBuf[8] = {0};
+    char compBuf[24] = {0};
+    
+    if (!SafeMemoryRead(g_xsjzbUidAddr, uidStr, 10) ||
+        !SafeMemoryRead(g_xsjzbUsernameAddr, userBuf, 8) ||
+        !SafeMemoryRead(g_xsjzbCompanyAddr, compBuf, 24)) {
+        LogMessage(L"[XSJZB] Failed to read current data from memory");
+        return false;
+    }
+    
+    uidOut = atol(uidStr);
+    usernameOut.assign(userBuf, 8);
+    companyOut.assign(compBuf, 24);
+    
+    wchar_t msg[256];
+    swprintf_s(msg, 256, L"[XSJZB] Current UID=%u", uidOut);
+    LogMessage(msg);
+    
+    return true;
+}
+
+// 计算 sector1 的校验和
+static DWORD CalculateSector1Checksum(const BYTE* sector1Data) {
+    DWORD sum = 0;
+    // 前 508 字节参与校验和计算
+    for (int i = 0; i < 508; i++) {
+        sum += sector1Data[i];
+    }
+    return sum;
+}
+
+// 动态生成 Sector 0 (基于当前内存数据)
+static bool GenerateDynamicSector0(BYTE* sector0, DWORD uid) {
+    // Sector0: UID的十进制字符串,其余填充0x00
+    memset(sector0, 0x00, 512);
+    
+    char uidStr[32];
+    sprintf_s(uidStr, sizeof(uidStr), "%u", uid);
+    memcpy(sector0, uidStr, strlen(uidStr));
+    
+    return true;
+}
+
+// 动态生成 Sector 1 (基于当前内存数据)
+static bool GenerateDynamicSector1(BYTE* sector1) {
+    if (!g_xsjzbDataLocated) {
+        return false;
+    }
+    
+    DWORD uid;
+    std::string username, company;
+    if (!ReadCurrentXsjzbData(uid, username, company)) {
+        return false;
+    }
+    
+    // 清零
+    memset(sector1, 0x00, 512);
+    
+    // 获取当前年份
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    int currentYear = st.wYear;
+    int nextYear = currentYear + 1;
+    
+    // 构建 sector1 模板(与launcher一致)
+    // 格式: 用户名 + 年检信息模板
+    char sector1Template[512];
+    int offset = sprintf_s(sector1Template, sizeof(sector1Template),
+                          "%s  %d\xc4\xea\xb6\xc8\xd3\xda%d-01-01 12:00:00 %d\xc4\xea\xb6\xc8\xd3\xda%d-01-01 12:00:00 \xd2\xd1\xb1\xb8\xb0\xb8-\xd4\xda\xd3\xc3        000000000000000000000000000000000        %s",
+                          username.c_str(), currentYear, currentYear, nextYear, nextYear, company.c_str());
+    
+    if (offset > 0 && offset < 512) {
+        memcpy(sector1, sector1Template, offset);
+    }
+    
+    // 注意: 校验和会在launcher的UpdateSector1Checksum中计算
+    // 这里我们简化,不计算校验和(因为xsjzb可能不检查)
+    
+    return true;
+}
+
+// 生成并保存缓存文件
+static bool GenerateCacheFromXsjzbValues(DWORD uid, const std::string& username, const std::string& company) {
+    // 随机生成 HID (使用加密安全的随机数)
+    HCRYPTPROV hProv = 0;
+    DWORD hid = 0;
+    if (CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+        CryptGenRandom(hProv, sizeof(DWORD), (BYTE*)&hid);
+        CryptReleaseContext(hProv, 0);
+        hid |= 0x80000000; // 确保最高位为 1
+    } else {
+        hid = 0x87654321; // 回退默认值
+    }
+    
+    // 准备 sector0 和 sector1
+    BYTE sector0[512] = {0};
+    BYTE sector1[512] = {0};
+    
+    // sector0: 8个 mini-block, 每个64字节
+    for (int i = 0; i < 8; i++) {
+        memset(sector0 + i * 64, 0xFF, 64);
+    }
+    
+    // sector1 结构:
+    // [0-7]: 用户名 (GB2312, 最多8字节)
+    // [8-15]: 年检日期 ("20241115", 8字节)
+    // [16-39]: 公司名 (GB2312, 最多24字节)
+    // [40-507]: 填充 0xFF
+    // [508-511]: 校验和 (DWORD, little-endian)
+    
+    // 复制用户名
+    if (username.size() > 0) {
+        size_t copyLen = (username.size() > 8) ? 8 : username.size();
+        memcpy(sector1, username.c_str(), copyLen);
+    }
+    
+    // 写入年检日期
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    char dateStr[9];
+    sprintf_s(dateStr, "%04d%02d%02d", st.wYear, st.wMonth, st.wDay);
+    memcpy(sector1 + 8, dateStr, 8);
+    
+    // 复制公司名
+    if (company.size() > 0) {
+        size_t copyLen = (company.size() > 24) ? 24 : company.size();
+        memcpy(sector1 + 16, company.c_str(), copyLen);
+    }
+    
+    // 填充剩余部分
+    memset(sector1 + 40, 0xFF, 468);
+    
+    // 计算并写入校验和
+    DWORD checksum = CalculateSector1Checksum(sector1);
+    memcpy(sector1 + 508, &checksum, 4);
+    
+    // 获取缓存目录
+    const std::wstring& cacheDir = GetCacheDirectory();
+    
+    // 保存 device.cfg
+    wchar_t configPath[MAX_PATH];
+    swprintf_s(configPath, L"%sdevice.cfg", cacheDir.c_str());
+    FILE* fp = _wfopen(configPath, L"wt, ccs=UTF-8");
+    if (!fp) {
+        LogMessage(L"[CACHE] Failed to create device.cfg");
+        return false;
+    }
+    
+    std::wstring serial = GenerateSerialFromHidUid(hid, uid);
+    fprintf(fp, "HID=0x%08X\n", hid);
+    fprintf(fp, "UID=%u\n", uid);
+    fprintf(fp, "VID=0x096E\n");
+    fprintf(fp, "PID=0x0201\n");
+    fprintf(fp, "Version=0x0100\n");
+    fprintf(fp, "ProductString=ROCKEY2\n");
+    fwprintf(fp, L"SerialNumberString=%s\n", serial.c_str());
+    fprintf(fp, "FeatureReportLength=65\n");
+    fprintf(fp, "InputReportLength=65\n");
+    fprintf(fp, "OutputReportLength=65\n");
+    fprintf(fp, "Usage=1\n");
+    fprintf(fp, "UsagePage=65280\n");
+    fclose(fp);
+    
+    // 保存 sector0
+    swprintf_s(configPath, L"%smem_%u_sector0.dat", cacheDir.c_str(), uid);
+    fp = _wfopen(configPath, L"wb");
+    if (fp) {
+        fwrite(sector0, 1, 512, fp);
+        fclose(fp);
+    }
+    
+    // 保存 sector1
+    swprintf_s(configPath, L"%smem_%u_sector1.dat", cacheDir.c_str(), uid);
+    fp = _wfopen(configPath, L"wb");
+    if (fp) {
+        fwrite(sector1, 1, 512, fp);
+        fclose(fp);
+    }
+    
+    wchar_t msg[512];
+    swprintf_s(msg, 512, L"[CACHE] Generated cache files: UID=%u, HID=0x%08X, Serial=%s, Checksum=0x%08X",
+               uid, hid, serial.c_str(), checksum);
+    LogMessage(msg);
+    
+    return true;
+}
+
 // Hook 函数实现
 VOID WINAPI Hook_HidD_GetHidGuid(LPGUID HidGuid) {
+    static bool dataLocateAttempted = false;
+    
     LogHidCall(L"HidD_GetHidGuid", L"Called");
+    
+    // 第一次调用时尝试定位 xsjzb 内存数据
+    if (!dataLocateAttempted) {
+        dataLocateAttempted = true;
+        
+        LogMessage(L"[XSJZB] Attempting to locate validation data in memory...");
+        
+        if (LocateXsjzbValidationData()) {
+            LogMessage(L"[XSJZB] Validation data located successfully - using dynamic memory access");
+            
+            // 读取当前的 UID/用户名/公司名，生成虚拟设备缓存数据
+            DWORD currentUid = 0;
+            std::string username, company;
+            if (ReadCurrentXsjzbData(currentUid, username, company)) {
+                // 生成随机 HID
+                HCRYPTPROV hProv = 0;
+                DWORD hid = 0;
+                if (CryptAcquireContextW(&hProv, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT)) {
+                    CryptGenRandom(hProv, sizeof(DWORD), (BYTE*)&hid);
+                    CryptReleaseContext(hProv, 0);
+                    hid |= 0x80000000; // 确保最高位为 1
+                } else {
+                    hid = 0x87654321; // 回退默认值
+                }
+                
+                // 填充 g_hidCache 结构
+                g_hidCache.vendorId = kTargetVendorId;     // 0x096E
+                g_hidCache.productId = kTargetProductId;   // 0x0201
+                g_hidCache.versionNumber = 0x0100;
+                g_hidCache.cachedUid = currentUid;
+                g_hidCache.cachedHid = hid;
+                
+                // 生成序列号
+                std::wstring serialNumber = GenerateSerialFromHidUid(hid, currentUid);
+                wcscpy_s(g_hidCache.serialNumberString, serialNumber.c_str());
+                
+                // 产品字符串（模拟真实的 Rockey2 USB 加密锁）
+                wcscpy_s(g_hidCache.productString, L"USB DONGLE");
+                
+                // 设置 HID Capabilities
+                g_hidCache.usage = 0x0000;
+                g_hidCache.usagePage = 0x0000;
+                g_hidCache.inputReportLength = 0;
+                g_hidCache.outputReportLength = 0;
+                g_hidCache.featureReportLength = 73;
+                
+                // 生成 sector 数据到 partition
+                BYTE sector0[512], sector1[512];
+                GenerateDynamicSector0(sector0, currentUid);
+                GenerateDynamicSector1(sector1);
+                
+                // 复制到 partition（8个64字节块）
+                memcpy(g_hidCache.partition0, sector0, 512);
+                memcpy(g_hidCache.partition1, sector1, 512);
+                
+                g_hidCache.isValid = true;
+                
+                wchar_t msg[256];
+                swprintf_s(msg, 256, L"[CACHE] Generated virtual device data: UID=%u, HID=0x%08X, Serial=%s",
+                           currentUid, hid, serialNumber.c_str());
+                LogMessage(msg);
+            }
+        } else {
+            LogMessage(L"[XSJZB] Failed to locate validation data (wrong version or not xsjzb.exe?)");
+        }
+    }
+    
     Real_HidD_GetHidGuid(HidGuid);
 }
 
 BOOLEAN WINAPI Hook_HidD_GetAttributes(HANDLE HidDeviceObject, PHIDD_ATTRIBUTES Attributes) {
     EnsureCacheLoaded();
     
-    // 【策略】只劫持第一个真实设备,其他设备返回失败
-    static bool firstDeviceHijacked = false;
+    // 检查是否已定位 xsjzb 数据或有缓存
+    bool canEmulate = g_xsjzbDataLocated || g_hidCache.isValid;
     
     // 如果是虚拟句柄,总是返回虚拟设备信息
-    if (HidDeviceObject == (HANDLE)0xCAFEBABE && g_hidCache.isValid && Attributes) {
+    if (HidDeviceObject == (HANDLE)0xCAFEBABE && canEmulate && Attributes) {
         Attributes->Size = sizeof(HIDD_ATTRIBUTES);
         Attributes->VendorID = kTargetVendorId;      // 固定值 0x096E
         Attributes->ProductID = kTargetProductId;    // 固定值 0x0201
@@ -803,12 +1470,16 @@ BOOLEAN WINAPI Hook_HidD_GetAttributes(HANDLE HidDeviceObject, PHIDD_ATTRIBUTES 
         return TRUE;
     }
     
-    // 如果有缓存且第一个设备还没被劫持,劫持这个设备
-    if (g_hidCache.isValid && !firstDeviceHijacked && Attributes) {
-        firstDeviceHijacked = true;
-        
+    // 检查这个句柄是否已经在劫持列表中
+    InitHijackedHandles();
+    EnterCriticalSection(&g_hijackedHandlesCs);
+    bool alreadyHijacked = std::find(g_hijackedHandles.begin(), g_hijackedHandles.end(), HidDeviceObject) != g_hijackedHandles.end();
+    bool hasAnyHijacked = !g_hijackedHandles.empty();
+    LeaveCriticalSection(&g_hijackedHandlesCs);
+    
+    // 如果可以模拟且还没劫持任何设备,劫持当前这个设备
+    if (canEmulate && !hasAnyHijacked && Attributes) {
         // 添加到劫持句柄列表
-        InitHijackedHandles();
         EnterCriticalSection(&g_hijackedHandlesCs);
         g_hijackedHandles.push_back(HidDeviceObject);
         LeaveCriticalSection(&g_hijackedHandlesCs);
@@ -830,7 +1501,7 @@ BOOLEAN WINAPI Hook_HidD_GetAttributes(HANDLE HidDeviceObject, PHIDD_ATTRIBUTES 
     BOOLEAN result = Real_HidD_GetAttributes(HidDeviceObject, Attributes);
     
     // 如果是目标 VID/PID 的设备,也添加到劫持列表
-    if (result && g_hidCache.isValid && Attributes &&
+    if (result && canEmulate && Attributes &&
         Attributes->VendorID == kTargetVendorId &&
         Attributes->ProductID == kTargetProductId) {
         
@@ -845,14 +1516,8 @@ BOOLEAN WINAPI Hook_HidD_GetAttributes(HANDLE HidDeviceObject, PHIDD_ATTRIBUTES 
         LeaveCriticalSection(&g_hijackedHandlesCs);
     }
     
-    if (result && Attributes) {
-        wchar_t details[256];
-        swprintf_s(details, 256, L"VID=0x%04X, PID=0x%04X, Version=0x%04X [REAL DEVICE]",
-                 Attributes->VendorID, Attributes->ProductID, Attributes->VersionNumber);
-        LogHidCall(L"HidD_GetAttributes", details);
-    } else {
-        LogHidCall(L"HidD_GetAttributes", L"Failed");
-    }
+    // 不记录普通真实设备的属性（太多了）
+    // 只在上面记录了劫持设备和虚拟设备
     
     return result;
 }
@@ -864,8 +1529,9 @@ BOOLEAN WINAPI Hook_HidD_GetFeature(HANDLE HidDeviceObject, PVOID ReportBuffer, 
     bool usedCache = false;
     bool virtualized = false;
     
-    // 如果有缓存,直接从缓存返回数据(不检查句柄)
-    if (g_hidCache.isValid) {
+    // 检查是否可以模拟设备（缓存模式或动态内存模式）
+    bool canEmulate = g_xsjzbDataLocated || g_hidCache.isValid;
+    if (canEmulate) {
         // 从缓存返回数据
         EnterCriticalSection(&g_uidCollector.cs);
         BYTE sector = g_uidCollector.pendingReadSector;
@@ -881,7 +1547,40 @@ BOOLEAN WINAPI Hook_HidD_GetFeature(HANDLE HidDeviceObject, PVOID ReportBuffer, 
             data[4] = block;
             memcpy(&data[5], &g_hidCache.cachedUid, 4);
             
-            // Copy data from cache
+            // 如果定位了xsjzb数据,使用动态生成的sector数据
+            if (g_xsjzbDataLocated) {
+                BYTE dynamicSector[512];
+                bool generated = false;
+                
+                // 读取当前UID
+                DWORD currentUid = 0;
+                std::string username, company;
+                if (ReadCurrentXsjzbData(currentUid, username, company)) {
+                    if (sector == 0) {
+                        generated = GenerateDynamicSector0(dynamicSector, currentUid);
+                    } else if (sector == 1) {
+                        generated = GenerateDynamicSector1(dynamicSector);
+                    }
+                }
+                
+                if (generated) {
+                    // 复制对应的64字节block
+                    memcpy(&data[9], &dynamicSector[block * 64], 64);
+                    
+                    result = TRUE;
+                    usedCache = true;
+                    virtualized = true;
+                    
+                    wchar_t msg[256];
+                    swprintf_s(msg, 256, L"[DYNAMIC DATA] GetFeature: Sector=%d, Block=%d (from xsjzb memory)", 
+                               sector, block);
+                    LogMessage(msg);
+                    LeaveCriticalSection(&g_uidCollector.cs);
+                    goto log_and_return;
+                }
+            }
+            
+            // 回退到缓存数据
             if (sector == 0) {
                 memcpy(&data[9], g_hidCache.partition0[block], 64);
             } else {
@@ -901,7 +1600,8 @@ BOOLEAN WINAPI Hook_HidD_GetFeature(HANDLE HidDeviceObject, PVOID ReportBuffer, 
     } else {
         result = Real_HidD_GetFeature(HidDeviceObject, ReportBuffer, ReportBufferLength);
     }
-    
+
+log_and_return:
     if (result && !virtualized) {
         // 检查是否需要使用缓存
         EnterCriticalSection(&g_uidCollector.cs);
@@ -1057,8 +1757,9 @@ BOOLEAN WINAPI Hook_HidD_SetFeature(HANDLE HidDeviceObject, PVOID ReportBuffer, 
 BOOLEAN WINAPI Hook_HidD_FlushQueue(HANDLE HidDeviceObject) {
     EnsureCacheLoaded();
     
-    // 如果有缓存,直接成功(不检查句柄)
-    if (g_hidCache.isValid) {
+    // 检查是否可以模拟设备
+    bool canEmulate = g_xsjzbDataLocated || g_hidCache.isValid;
+    if (canEmulate) {
         wchar_t msg[256];
         swprintf_s(msg, 256, L"FlushQueue success - Handle=0x%p (using cache)", HidDeviceObject);
         LogHidCall(L"HidD_FlushQueue", msg);
@@ -1078,7 +1779,8 @@ BOOLEAN WINAPI Hook_HidD_GetPreparsedData(HANDLE HidDeviceObject, PHIDP_PREPARSE
     EnsureCacheLoaded();
     
     // 虚拟句柄：返回一个假的PreparsedData指针
-    if (HidDeviceObject == (HANDLE)0xCAFEBABE && g_hidCache.isValid) {
+    bool canEmulate = g_xsjzbDataLocated || g_hidCache.isValid;
+    if (HidDeviceObject == (HANDLE)0xCAFEBABE && canEmulate) {
         if (PreparsedData) {
             // 返回一个非NULL的假指针（用于HidP_GetCaps）
             *PreparsedData = (PHIDP_PREPARSED_DATA)0xDEADBEEF;
@@ -1128,8 +1830,9 @@ BOOLEAN WINAPI Hook_HidD_GetProductString(HANDLE HidDeviceObject, PVOID Buffer, 
     
     // 检查虚拟句柄或有缓存
     bool isVirtualHandle = (HidDeviceObject == (HANDLE)0xCAFEBABE);
+    bool canEmulate = g_xsjzbDataLocated || g_hidCache.isValid;
     
-    if ((isVirtualHandle || g_hidCache.isValid) && g_hidCache.isValid && Buffer && BufferLength > 0) {
+    if ((isVirtualHandle || canEmulate) && g_hidCache.isValid && Buffer && BufferLength > 0) {
         // 返回缓存的产品字符串
         size_t len = wcslen(g_hidCache.productString);
         size_t copyLen = (len + 1) * sizeof(wchar_t);
@@ -1156,7 +1859,29 @@ BOOLEAN WINAPI Hook_HidD_GetSerialNumberString(HANDLE HidDeviceObject, PVOID Buf
     bool isVirtualHandle = (HidDeviceObject == (HANDLE)0xCAFEBABE);
     
     if ((isVirtualHandle || g_hidCache.isValid) && g_hidCache.isValid && Buffer && BufferLength > 0) {
-        // 返回缓存的序列号字符串
+        // 如果定位了xsjzb数据,使用动态UID生成序列号
+        if (g_xsjzbDataLocated) {
+            DWORD currentUid = 0;
+            std::string username, company;
+            if (ReadCurrentXsjzbData(currentUid, username, company)) {
+                // 使用缓存的HID和当前UID生成序列号
+                std::wstring dynamicSerial = GenerateSerialFromHidUid(g_hidCache.cachedHid, currentUid);
+                
+                size_t len = dynamicSerial.length();
+                size_t copyLen = (len + 1) * sizeof(wchar_t);
+                if (copyLen > BufferLength) copyLen = BufferLength;
+                
+                memcpy(Buffer, dynamicSerial.c_str(), copyLen);
+                ((wchar_t*)Buffer)[BufferLength / sizeof(wchar_t) - 1] = L'\0';
+                
+                wchar_t details[256];
+                swprintf_s(details, 256, L"Serial: %s [DYNAMIC from UID=%u]", dynamicSerial.c_str(), currentUid);
+                LogHidCall(L"HidD_GetSerialNumberString", details);
+                return TRUE;
+            }
+        }
+        
+        // 回退到缓存的序列号字符串
         size_t len = wcslen(g_hidCache.serialNumberString);
         size_t copyLen = (len + 1) * sizeof(wchar_t);
         if (copyLen > BufferLength) copyLen = BufferLength;
@@ -1191,6 +1916,13 @@ BOOL WINAPI Hook_SetupDiEnumDeviceInterfaces(
         g_lastDeviceInfoHandle = DeviceInfoSet;
         g_lastRealDeviceIndex = 0;
         g_virtualDeviceInjected = false;
+        
+        // 清空劫持列表,允许新会话重新劫持设备
+        InitHijackedHandles();
+        EnterCriticalSection(&g_hijackedHandlesCs);
+        g_hijackedHandles.clear();
+        LeaveCriticalSection(&g_hijackedHandlesCs);
+        
         LogMessage(L"[ENUM] New device enumeration session started");
     }
     
@@ -1200,23 +1932,23 @@ BOOL WINAPI Hook_SetupDiEnumDeviceInterfaces(
     if (result) {
         // 真实设备存在
         g_lastRealDeviceIndex = MemberIndex;
-        wchar_t msg[256];
-        swprintf_s(msg, 256, L"[ENUM] Real device found at index %lu", MemberIndex);
-        LogMessage(msg);
+        // 不记录每个真实设备（太多了）
         return TRUE;
     }
     
     // result == FALSE：没有更多真实设备
     DWORD error = GetLastError();
     
-    // 【禁用虚拟设备注入】因为已经劫持了第一个真实设备
-    // 如果启用了第一个设备劫持,就不需要再注入虚拟设备了
+    // 【策略】优先劫持第一个真实设备，只有在没有劫持任何设备时才注入虚拟设备
     EnterCriticalSection(&g_hijackedHandlesCs);
     bool hasHijackedHandles = !g_hijackedHandles.empty();
     LeaveCriticalSection(&g_hijackedHandlesCs);
-    if (error == ERROR_NO_MORE_ITEMS && g_hidCache.isValid && !g_virtualDeviceInjected && !hasHijackedHandles) {
-        // 仅在没有劫持真实设备时才注入虚拟设备(当前已禁用)
-        // 注入虚拟设备!
+    
+    // 检查是否可以模拟（缓存或动态内存）
+    bool canEmulate = g_xsjzbDataLocated || g_hidCache.isValid;
+    
+    // 仅在没有劫持真实设备时才注入虚拟设备
+    if (error == ERROR_NO_MORE_ITEMS && canEmulate && !g_virtualDeviceInjected && !hasHijackedHandles) {
         g_virtualDeviceInjected = true;
         
         // 填充 DeviceInterfaceData
@@ -1233,7 +1965,7 @@ BOOL WINAPI Hook_SetupDiEnumDeviceInterfaces(
         LogMessage(msg);
         
         SetLastError(ERROR_SUCCESS);
-        return TRUE;  // 告诉应用程序：还有一个设备！
+        return TRUE;
     }
     
     // 否则返回原始错误
@@ -1254,7 +1986,9 @@ BOOL WINAPI Hook_SetupDiGetDeviceInterfaceDetailW(
     // 检查是否是虚拟设备（通过 Reserved 字段判断）
     bool isVirtualDevice = (DeviceInterfaceData && DeviceInterfaceData->Reserved == VIRTUAL_DEVICE_INDEX_MARKER);
     
-    if (isVirtualDevice && g_hidCache.isValid) {
+    // 虚拟设备检查 - 支持缓存模式或动态模式
+    bool canEmulate = g_xsjzbDataLocated || g_hidCache.isValid;
+    if (isVirtualDevice && canEmulate) {
         // 计算需要的大小
         DWORD pathLen = (DWORD)wcslen(VIRTUAL_DEVICE_PATH);
         DWORD requiredSize = offsetof(SP_DEVICE_INTERFACE_DETAIL_DATA_W, DevicePath) + (pathLen + 1) * sizeof(WCHAR);
@@ -1302,16 +2036,13 @@ HANDLE WINAPI Hook_CreateFileW(
 ) {
     EnsureCacheLoaded();
     
-    // 调试: 记录所有 HID 设备打开
-    if (lpFileName && wcsstr(lpFileName, L"hid#")) {
-        wchar_t msg[768];
-        swprintf_s(msg, 768, L"[CREATEFILE DEBUG] Path: %s", lpFileName);
-        LogMessage(msg);
-    }
+    // 只记录关键的设备打开（劫持/虚拟设备）
+    // 不记录所有真实设备打开，避免日志过多
     
     // 检查是否是我们的虚拟设备路径
+    bool canEmulate = g_xsjzbDataLocated || g_hidCache.isValid;
     if (lpFileName && wcsstr(lpFileName, L"VID_096E&PID_0201") && wcsstr(lpFileName, L"VIRTUAL_CACHE")) {
-        if (g_hidCache.isValid) {
+        if (canEmulate) {
             // 创建一个虚拟句柄（使用特殊值）
             HANDLE virtualHandle = (HANDLE)0xCAFEBABE;  // 魔数标记
             
@@ -1330,7 +2061,7 @@ HANDLE WINAPI Hook_CreateFileW(
                                        dwFlagsAndAttributes, hTemplateFile);
     
     // 如果成功打开,且是目标 VID/PID 的 HID 设备路径,添加到劫持列表
-    if (hDevice != INVALID_HANDLE_VALUE && g_hidCache.isValid && lpFileName) {
+    if (hDevice != INVALID_HANDLE_VALUE && canEmulate && lpFileName) {
         // 检查是否是目标设备路径 (VID_096E&PID_0201)
         if (wcsstr(lpFileName, L"hid#") && 
             wcsstr(lpFileName, L"vid_096e") && 
