@@ -1,55 +1,54 @@
 # build.ps1 - Quick Build Script for HID Proxy Project
 param(
-    [string]$Config = "Release",
-    [string]$Generator = "Visual Studio 17 2022",
-    [string]$Arch = "x64"
+    [string]$Config = "Release"
 )
 
 Write-Host "=== HID Proxy Build Script ===" -ForegroundColor Cyan
 Write-Host "Configuration: $Config" -ForegroundColor Yellow
-Write-Host "Generator: $Generator" -ForegroundColor Yellow
-Write-Host "Architecture: $Arch" -ForegroundColor Yellow
 Write-Host ""
 
-# 创建 build 目录
-if (-not (Test-Path "build")) {
-    Write-Host "Creating build directory..." -ForegroundColor Green
-    New-Item -ItemType Directory -Path "build" | Out-Null
-}
-
-# 进入 build 目录
-Push-Location "build"
+# 进入 injector 目录编译
+Push-Location "injector\build"
 
 try {
-    # 配置 CMake
-    Write-Host "Configuring CMake..." -ForegroundColor Green
-    cmake .. -G "$Generator" -A $Arch
-    
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "CMake configuration failed!" -ForegroundColor Red
-        exit 1
-    }
-    
-    # 编译
-    Write-Host ""
-    Write-Host "Building project..." -ForegroundColor Green
-    cmake --build . --config $Config
+    # 编译 injector 项目
+    Write-Host "Building injector project..." -ForegroundColor Green
+    cmake --build . --config $Config --target hid_hook --target hid_launcher
     
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Build failed!" -ForegroundColor Red
         exit 1
     }
     
+    Pop-Location
+    
+    # 创建根目录的 build\bin 目录
+    $buildBinDir = "build\bin\$Config"
+    if (-not (Test-Path $buildBinDir)) {
+        Write-Host "Creating output directory: $buildBinDir" -ForegroundColor Green
+        New-Item -ItemType Directory -Path $buildBinDir -Force | Out-Null
+    }
+    
+    # 复制文件到根目录 build
+    Write-Host "Copying files to $buildBinDir..." -ForegroundColor Green
+    Copy-Item "injector\build\bin\$Config\hid_hook.dll" -Destination "$buildBinDir\" -Force
+    Copy-Item "injector\build\bin\$Config\hid_launcher.exe" -Destination "$buildBinDir\" -Force
+    
     Write-Host ""
     Write-Host "Build succeeded!" -ForegroundColor Green
     Write-Host ""
     Write-Host "Output files:" -ForegroundColor Cyan
-    Write-Host "  - DLL:     bin\$Config\hid.dll" -ForegroundColor Yellow
-    Write-Host "  - Console: bin\$Config\hid_console.exe" -ForegroundColor Yellow
+    Write-Host "  - DLL:      $buildBinDir\hid_hook.dll" -ForegroundColor Yellow
+    Write-Host "  - Launcher: $buildBinDir\hid_launcher.exe" -ForegroundColor Yellow
     Write-Host ""
-    Write-Host "To run the console application:" -ForegroundColor Cyan
-    Write-Host "  .\bin\$Config\hid_console.exe" -ForegroundColor Yellow
+    Write-Host "To deploy:" -ForegroundColor Cyan
+    Write-Host "  Copy-Item '$buildBinDir\hid_hook.dll' -Destination 'C:\Xsj_Soft\Xsjzb\' -Force" -ForegroundColor Gray
     
+} catch {
+    Write-Host "Error: $_" -ForegroundColor Red
+    exit 1
 } finally {
-    Pop-Location
+    if ((Get-Location).Path -ne $PSScriptRoot) {
+        Pop-Location
+    }
 }

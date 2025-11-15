@@ -83,15 +83,45 @@ static void EnsureCacheLoaded() {
                 char line[512];
                 while (fgets(line, sizeof(line), fp)) {
                     if (strncmp(line, "HID=", 4) == 0) {
-                        sscanf_s(line + 4, "0x%X", &g_hidCache.cachedHid);
+                        // 兼容十六进制 (0x...) 和十进制格式
+                        const char* value = line + 4;
+                        if (strncmp(value, "0x", 2) == 0 || strncmp(value, "0X", 2) == 0) {
+                            sscanf_s(value, "0x%X", &g_hidCache.cachedHid);
+                        } else {
+                            sscanf_s(value, "%u", &g_hidCache.cachedHid);
+                        }
                     } else if (strncmp(line, "UID=", 4) == 0) {
-                        sscanf_s(line + 4, "0x%X", &g_hidCache.cachedUid);
-                    } else if (strncmp(line, "VID=", 4) == 0) {
-                        sscanf_s(line + 4, "0x%hX", &g_hidCache.vendorId);
-                    } else if (strncmp(line, "PID=", 4) == 0) {
-                        sscanf_s(line + 4, "0x%hX", &g_hidCache.productId);
-                    } else if (strncmp(line, "Version=", 8) == 0) {
-                        sscanf_s(line + 8, "0x%hX", &g_hidCache.versionNumber);
+                        // 兼容十六进制 (0x...) 和十进制格式
+                        const char* value = line + 4;
+                        if (strncmp(value, "0x", 2) == 0 || strncmp(value, "0X", 2) == 0) {
+                            sscanf_s(value, "0x%X", &g_hidCache.cachedUid);
+                        } else {
+                            sscanf_s(value, "%u", &g_hidCache.cachedUid);
+                        }
+                    } else if (strncmp(line, "VID=", 4) == 0 || strncmp(line, "VendorID=", 9) == 0) {
+                        // 兼容 VID= 和 VendorID=, 以及十六进制和十进制
+                        const char* value = (line[1] == 'I') ? (line + 4) : (line + 9);
+                        if (strncmp(value, "0x", 2) == 0 || strncmp(value, "0X", 2) == 0) {
+                            sscanf_s(value, "0x%hX", &g_hidCache.vendorId);
+                        } else {
+                            sscanf_s(value, "%hu", &g_hidCache.vendorId);
+                        }
+                    } else if (strncmp(line, "PID=", 4) == 0 || strncmp(line, "ProductID=", 10) == 0) {
+                        // 兼容 PID= 和 ProductID=, 以及十六进制和十进制
+                        const char* value = (line[1] == 'I') ? (line + 4) : (line + 10);
+                        if (strncmp(value, "0x", 2) == 0 || strncmp(value, "0X", 2) == 0) {
+                            sscanf_s(value, "0x%hX", &g_hidCache.productId);
+                        } else {
+                            sscanf_s(value, "%hu", &g_hidCache.productId);
+                        }
+                    } else if (strncmp(line, "Version=", 8) == 0 || strncmp(line, "VersionNumber=", 14) == 0) {
+                        // 兼容 Version= 和 VersionNumber=, 以及十六进制和十进制
+                        const char* value = (line[7] == '=') ? (line + 8) : (line + 14);
+                        if (strncmp(value, "0x", 2) == 0 || strncmp(value, "0X", 2) == 0) {
+                            sscanf_s(value, "0x%hX", &g_hidCache.versionNumber);
+                        } else {
+                            sscanf_s(value, "%hu", &g_hidCache.versionNumber);
+                        }
                     } else if (strncmp(line, "ProductString=", 14) == 0) {
                         char productStr[256];
                         strncpy_s(productStr, sizeof(productStr), line + 14, _TRUNCATE);
@@ -762,9 +792,9 @@ BOOLEAN WINAPI Hook_HidD_GetAttributes(HANDLE HidDeviceObject, PHIDD_ATTRIBUTES 
     // 如果是虚拟句柄,总是返回虚拟设备信息
     if (HidDeviceObject == (HANDLE)0xCAFEBABE && g_hidCache.isValid && Attributes) {
         Attributes->Size = sizeof(HIDD_ATTRIBUTES);
-        Attributes->VendorID = g_hidCache.vendorId;
-        Attributes->ProductID = g_hidCache.productId;
-        Attributes->VersionNumber = g_hidCache.versionNumber;
+        Attributes->VendorID = kTargetVendorId;      // 固定值 0x096E
+        Attributes->ProductID = kTargetProductId;    // 固定值 0x0201
+        Attributes->VersionNumber = 0x0100;          // 固定值 0x0100
         
         wchar_t details[256];
         swprintf_s(details, 256, L"VID=0x%04X, PID=0x%04X, Version=0x%04X [VIRTUAL HANDLE]",
@@ -784,9 +814,9 @@ BOOLEAN WINAPI Hook_HidD_GetAttributes(HANDLE HidDeviceObject, PHIDD_ATTRIBUTES 
         LeaveCriticalSection(&g_hijackedHandlesCs);
         
         Attributes->Size = sizeof(HIDD_ATTRIBUTES);
-        Attributes->VendorID = g_hidCache.vendorId;
-        Attributes->ProductID = g_hidCache.productId;
-        Attributes->VersionNumber = g_hidCache.versionNumber;
+        Attributes->VendorID = kTargetVendorId;      // 固定值 0x096E
+        Attributes->ProductID = kTargetProductId;    // 固定值 0x0201
+        Attributes->VersionNumber = 0x0100;          // 固定值 0x0100
         
         wchar_t details[256];
         swprintf_s(details, 256, L"VID=0x%04X, PID=0x%04X, Version=0x%04X [FIRST DEVICE HIJACKED - Handle=0x%p]",
@@ -801,8 +831,8 @@ BOOLEAN WINAPI Hook_HidD_GetAttributes(HANDLE HidDeviceObject, PHIDD_ATTRIBUTES 
     
     // 如果是目标 VID/PID 的设备,也添加到劫持列表
     if (result && g_hidCache.isValid && Attributes &&
-        Attributes->VendorID == g_hidCache.vendorId &&
-        Attributes->ProductID == g_hidCache.productId) {
+        Attributes->VendorID == kTargetVendorId &&
+        Attributes->ProductID == kTargetProductId) {
         
         InitHijackedHandles();
         EnterCriticalSection(&g_hijackedHandlesCs);
